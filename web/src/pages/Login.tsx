@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ExternalLink, Loader2, LogIn } from "lucide-react";
 import { api } from "@/api/client";
-import type { TidalLoginClient } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { retryBoot } from "@/lib/bootRetry";
@@ -41,12 +40,16 @@ export function Login({ onLoggedIn }: { onLoggedIn: () => void }) {
 }
 
 /**
- * PKCE login — the only Tidal auth flow that unlocks Max (hi-res)
- * downloads. Paste-the-Oops-URL flow: user clicks Open Tidal login,
- * Safari / default browser handles sign-in (every SSO provider works
- * natively there), Tidal redirects to an "Oops" page whose URL
- * carries the PKCE code as a query param, user pastes that URL, we
- * exchange the code server-side and drop into the signed-in shell.
+ * PKCE login — the default sign-in. Paste-the-Oops-URL flow: user clicks
+ * Open Tidal login, the default browser handles sign-in (every SSO
+ * provider works natively there), Tidal redirects to an "Oops" page
+ * whose URL carries the PKCE code as a query param, the user pastes that
+ * URL, we exchange the code server-side and drop into the signed-in
+ * shell.
+ *
+ * Always runs under TIDAL's mobile client (index 0). The redirect lands
+ * on TIDAL's android login page, and every other client is refused there
+ * with error 11102, so there is no client picker to get wrong.
  */
 function PkceLogin({
   onLoggedIn,
@@ -59,31 +62,17 @@ function PkceLogin({
   const [redirectUrl, setRedirectUrl] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [clients, setClients] = useState<TidalLoginClient[]>([]);
-  const [selectedClient, setSelectedClient] = useState<number | null>(null);
-  const [clientError, setClientError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    retryBoot(() => api.auth.clients())
-      .then((r) => {
-        if (cancelled) return;
-        setClients(r.pkce_clients);
-        setSelectedClient(r.pkce_selected);
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setClientError("Couldn't load the TIDAL client list.");
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    retryBoot(() => api.auth.pkceUrl())
+    retryBoot(async () => {
+      // Pin TIDAL's mobile client before asking for the URL. The
+      // redirect is the android login page and every other client is
+      // refused there with error 11102.
+      const { pkce_selected } = await api.auth.clients();
+      if (pkce_selected !== 0) await api.auth.selectPkceClient(0);
+      return api.auth.pkceUrl();
+    })
       .then((r) => {
         if (!cancelled) setLoginUrl(r.url);
       })
@@ -94,20 +83,6 @@ function PkceLogin({
       cancelled = true;
     };
   }, []);
-
-  const changeClient = async (index: number) => {
-    setClientError(null);
-    setLoginUrl(null);
-    try {
-      await api.auth.selectPkceClient(index);
-      setSelectedClient(index);
-      // The URL embeds the client_id, so fetch a fresh one.
-      const r = await api.auth.pkceUrl();
-      setLoginUrl(r.url);
-    } catch (err) {
-      setClientError(err instanceof Error ? err.message : String(err));
-    }
-  };
 
   const openTidalLogin = async () => {
     if (!loginUrl) return;
@@ -137,35 +112,6 @@ function PkceLogin({
 
   return (
     <div className="flex w-full flex-col gap-4">
-      {clients.length > 1 && (
-        <div className="flex w-full flex-col gap-2">
-          <label
-            htmlFor="pkce-client"
-            className="text-xs font-semibold uppercase tracking-wider text-muted-foreground"
-          >
-            TIDAL client
-          </label>
-          <select
-            id="pkce-client"
-            value={selectedClient ?? clients[0]?.index ?? ""}
-            disabled={submitting}
-            onChange={(e) => changeClient(Number(e.target.value))}
-            className="h-10 w-full rounded-md border border-input bg-secondary px-3 text-sm"
-          >
-            {clients.map((client) => (
-              <option key={client.index} value={client.index}>
-                {client.platform} — {client.formats}
-              </option>
-            ))}
-          </select>
-          <p className="text-xs text-muted-foreground">
-            The mobile default is the only client known to unlock Max. Switch
-            clients if Tidal refuses Dolby Atmos, then log in again.
-          </p>
-        </div>
-      )}
-      {clientError && <p className="text-xs text-destructive">{clientError}</p>}
-
       <ol className="list-decimal space-y-2 pl-5 text-sm text-muted-foreground">
         <li>
           <button
@@ -227,16 +173,19 @@ function PkceLogin({
         onClick={onSwitchMode}
         className="text-center text-xs text-muted-foreground hover:text-foreground"
       >
-        Use the simpler code-based login instead (Lossless quality only)
+        Want Dolby Atmos? Use the code-based login (Tidal HiRes) — the browser
+        login only unlocks Max
       </button>
     </div>
   );
 }
 
 /**
- * Device-code login — the older, simpler "paste this code at tidal.com/link"
- * flow. Works fine but the resulting session is capped at Lossless quality
- * because tidalapi's device-code client_id isn't entitled for hi-res.
+ * Device-code login — the older "type this code at tidal.com/link" flow.
+ * Unlike the browser login it still yields a clear Dolby Atmos manifest,
+ * so it is the way to get Atmos. It always runs under TIDAL HiRes: the
+ * other clients in the table either fail the code flow or only deliver
+ * Max, so they are not offered.
  */
 function DeviceLogin({
   onLoggedIn,
@@ -252,37 +201,6 @@ function DeviceLogin({
     null,
   );
   const pollRef = useRef<number | null>(null);
-  const [clients, setClients] = useState<TidalLoginClient[]>([]);
-  const [selectedClient, setSelectedClient] = useState<number | null>(null);
-  const [clientError, setClientError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    retryBoot(() => api.auth.clients())
-      .then((r) => {
-        if (cancelled) return;
-        setClients(r.clients);
-        setSelectedClient(r.selected);
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setClientError("Couldn't load the TIDAL client list.");
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  const changeClient = async (index: number) => {
-    setClientError(null);
-    try {
-      await api.auth.selectClient(index);
-      setSelectedClient(index);
-    } catch (err) {
-      setClientError(err instanceof Error ? err.message : String(err));
-    }
-  };
 
   const startLogin = useCallback(async () => {
     setStatus("starting");
@@ -334,34 +252,10 @@ function DeviceLogin({
 
   return (
     <div className="flex w-full flex-col items-center gap-4">
-      {clients.length > 1 && (
-        <div className="flex w-full flex-col gap-2">
-          <label
-            htmlFor="tidal-client"
-            className="text-xs font-semibold uppercase tracking-wider text-muted-foreground"
-          >
-            TIDAL client
-          </label>
-          <select
-            id="tidal-client"
-            value={selectedClient ?? clients[0]?.index ?? ""}
-            disabled={status === "starting" || status === "waiting"}
-            onChange={(e) => changeClient(Number(e.target.value))}
-            className="h-10 w-full rounded-md border border-input bg-secondary px-3 text-sm"
-          >
-            {clients.map((client) => (
-              <option key={client.index} value={client.index}>
-                {client.platform} — {client.formats}
-              </option>
-            ))}
-          </select>
-          <p className="text-xs text-muted-foreground">
-            TIDAL picks the stream format per client. If Dolby Atmos falls back
-            to Max, switch clients and sign in again.
-          </p>
-        </div>
-      )}
-      {clientError && <p className="text-xs text-destructive">{clientError}</p>}
+      <p className="text-xs text-muted-foreground">
+        Always signs in with TIDAL HiRes — the only client that delivers Max
+        and clear Dolby Atmos.
+      </p>
 
       {status === "idle" && (
         <Button onClick={startLogin} size="lg" className="w-full">
@@ -411,7 +305,7 @@ function DeviceLogin({
         onClick={onSwitchMode}
         className="text-center text-xs text-muted-foreground hover:text-foreground"
       >
-        Use the hi-res login instead (unlocks Max quality)
+        Use the browser login instead
       </button>
     </div>
   );

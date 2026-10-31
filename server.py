@@ -1213,22 +1213,45 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
     # Tidal realtime listener: pauses local playback when another
     # device on the user's Tidal account starts playing. The listener
-    # recognises our own playback echoed back by Tidal (same session
-    # id as our access token's `sid`) and ignores it, otherwise every
-    # play through Tideway would pause itself.
+    # recognises our own playback echoed back by Tidal (any of the
+    # session ids in `_own_realtime_session_ids`) and ignores it,
+    # otherwise every play through Tideway would pause itself.
     def _on_other_device_started(payload: dict) -> None:
+        global _cross_device_pause_device
         if not getattr(settings, "pause_on_other_device", True):
             # User opted out: keep playing through cross-device events.
             return
-        global _cross_device_pause_device
+        # Defence in depth: never act on an echo of our own playback,
+        # even if the listener's id filter missed it.
+        payload = payload or {}
+        own_ids = _own_realtime_session_ids()
+        for key in ("sessionId", "playbackSessionId"):
+            value = payload.get(key)
+            if value and str(value).strip().lower() in own_ids:
+                return
+        # Nothing is playing locally → nothing to pause, and a
+        # "Paused — you're playing on X" banner would be a lie. This
+        # also swallows notifications that arrive between a local stop
+        # and the bus catching up.
+        try:
+            player = _native_player()
+            state = getattr(player.snapshot(), "state", None)
+        except Exception as exc:
+            print(
+                f"[tidal-realtime] player unavailable for pause: {exc!r}",
+                flush=True,
+            )
+            return
+        if state != "playing":
+            return
         # Record which device caused the pause BEFORE actually
         # pausing so a fast frontend poll of /api/player/state right
         # after the SSE pause event already sees the reason. The
         # _on_player_state callback clears this on the next play.
-        device = (payload.get("clientDisplayName") if payload else None) or "another device"
+        device = payload.get("clientDisplayName") or "another device"
         _cross_device_pause_device = str(device)
         try:
-            _native_player().pause()
+            player.pause()
         except Exception as exc:
             print(
                 f"[tidal-realtime] pause-on-other-device failed: {exc!r}",
@@ -1237,18 +1260,20 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
     def _tidal_token_provider() -> Optional[str]:
         try:
-            return getattr(tidal.session, "access_token", None)
+            token = getattr(tidal.session, "access_token", None)
         except Exception:
             return None
-
-    def _tidal_session_id_provider() -> Optional[str]:
-        return play_report_session_id(_tidal_token_provider())
+        # Remember every sid we see: the JWT's `sid` rotates on
+        # refresh, and Pushkin can echo the sid of the token the
+        # socket was minted with rather than the current one.
+        _remember_own_session_token(token)
+        return token
 
     try:
         _rt_listener = tidal_realtime.start_listener(
             token_provider=_tidal_token_provider,
             on_other_device_started=_on_other_device_started,
-            session_id_provider=_tidal_session_id_provider,
+            own_session_ids_provider=_own_realtime_session_ids,
         )
     except Exception as exc:
         print(f"[tidal-realtime] startup failed: {exc!r}", flush=True)
@@ -1266,14 +1291,15 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
         def _on_player_state(snapshot) -> None:
             global _cross_device_pause_device
-            is_playing = getattr(snapshot, "state", None) == "playing"
+            state = getattr(snapshot, "state", None)
+            is_playing = state == "playing"
             if is_playing and not _last_was_playing[0]:
                 _rt_listener.signal_user_action_sync()
-                # Clear the cross-device pause banner the moment
-                # the user resumes (or starts a new track). The
-                # banner only makes sense while paused-by-someone-
-                # else; once the local user takes over again the
-                # message is stale.
+            # The banner only describes a pause caused by another
+            # device. Clear it once the local user takes over (play)
+            # or the session ends (idle); a paused/loading state keeps
+            # it alive because that is exactly when it applies.
+            if state in ("playing", "idle"):
                 _cross_device_pause_device = None
             _last_was_playing[0] = is_playing
 
@@ -3438,24 +3464,50 @@ def auth_clients() -> dict:
     manifest variant (DRM-wrapped or clear) from that binding, so the
     client is what decides whether Dolby Atmos can be decoded locally.
 
-    Available while signed out: the picker lives on the login page,
-    which by definition renders before `_require_local_access()` would
-    succeed. The payload carries no credentials.
+    Only the HiRes entry is offered. The TV and legacy Fire TV entries
+    in api_keys still resolve so a stored session can refresh under the
+    pair that minted it, but they fail the code flow or only deliver
+    Max, so they are never selectable.
+
+    Available while signed out: the login page renders before
+    `_require_local_access()` would succeed. The payload carries no
+    credentials.
     """
     try:
         selected = int(settings.tidal_api_key_index)
     except (TypeError, ValueError):
+        selected = api_keys.DEFAULT_API_KEY_INDEX
+    # A settings.json from an older build can name a retired client;
+    # report the one the login will actually use, not the stale value.
+    if selected != api_keys.DEFAULT_API_KEY_INDEX:
         selected = api_keys.DEFAULT_API_KEY_INDEX
     try:
         pkce_selected = int(settings.tidal_pkce_client_index)
     except (TypeError, ValueError):
         pkce_selected = api_keys.PKCE_DEFAULT_INDEX
     return {
-        "clients": api_keys.public_items(),
+        "clients": _offered_login_clients(),
         "selected": selected,
-        "pkce_clients": api_keys.pkce_public_items(),
+        "pkce_clients": _offered_pkce_clients(),
         "pkce_selected": pkce_selected,
     }
+
+
+def _offered_login_clients() -> list[dict]:
+    """The device-code picker is HiRes-only; see `auth_clients`."""
+    return [
+        item
+        for item in api_keys.public_items()
+        if item["index"] == api_keys.DEFAULT_API_KEY_INDEX
+    ]
+
+
+def _offered_pkce_clients() -> list[dict]:
+    """Mobile (index 0) plus HiRes — the only two that can sign in."""
+    offered = {api_keys.PKCE_DEFAULT_INDEX, api_keys.DEFAULT_API_KEY_INDEX}
+    return [
+        item for item in api_keys.pkce_public_items() if item["index"] in offered
+    ]
 
 
 @app.post("/api/auth/client")
@@ -3468,19 +3520,18 @@ def auth_select_client(req: ApiClientRequest) -> dict:
     running — the choice applies the next time device login is used.
     """
     global settings
-    key = api_keys.get_item(req.index)
-    if key is None:
+    if req.index != api_keys.DEFAULT_API_KEY_INDEX:
         raise HTTPException(status_code=400, detail="Unknown TIDAL client index")
-    reauth = tidal.select_api_key(key.index)
+    reauth = tidal.select_api_key(req.index)
     # select_api_key writes settings.json itself; mirror the value into
     # the live object so /api/settings agrees until the next reload.
-    settings.tidal_api_key_index = key.index
+    settings.tidal_api_key_index = req.index
     if reauth:
         _invalidate_auth_cache()
         _invalidate_preview_cache()
         _invalidate_page_cache()
         _invalidate_detail_cache()
-    return {"ok": True, "index": key.index, "reauth_required": reauth}
+    return {"ok": True, "index": req.index, "reauth_required": reauth}
 
 
 @app.post("/api/auth/pkce-client")
@@ -5047,12 +5098,17 @@ def play_report_start(req: dict) -> dict:
     one message — that's how Tidal's own SDKs structure `playback_session`.
     """
     _require_auth()
-    return {"session_id": str(uuid.uuid4()), "ts_ms": int(time.time() * 1000)}
+    session_id = str(uuid.uuid4())
+    # Remembered so the realtime listener recognises Tidal's echo of
+    # this play as ours instead of "another device" and pauses us.
+    _remember_play_report_session(session_id)
+    return {"session_id": session_id, "ts_ms": int(time.time() * 1000)}
 
 
 @app.post("/api/play-report/stop")
 def play_report_stop(req: PlayReportStopRequest) -> dict:
     _require_auth()
+    _remember_play_report_session(req.session_id)
     play_reporter.record(
         PlaySession(
             session_id=req.session_id,
@@ -5120,6 +5176,7 @@ def play_report_diagnose(req: _PlayReportDiagnoseRequest) -> dict:
         start_position_s=0.0,
         end_position_s=30.0,
     )
+    _remember_play_report_session(synthetic.session_id)
     before = len(play_report_recent_log())
     play_reporter.record(synthetic)
     # Poll the log for up to 5s for the new entry to land. Background
@@ -5665,6 +5722,49 @@ _pcm_player_singleton: Optional[PCMPlayer] = None
 # is enough — only one device can hold the privileged session at a
 # time, so there's no race to worry about.
 _cross_device_pause_device: Optional[str] = None
+
+# Ids TIDAL may stamp on a realtime notification that is really our own
+# playback echoed back. The JWT `sid` is the usual one, but it rotates
+# on refresh, and TIDAL's event pipeline can echo the
+# `playbackSessionId` UUID we attach to play reports instead. Remember
+# both so the self-echo filter isn't limited to the current token.
+_tidal_own_ids: set[str] = set()
+_recent_play_session_ids: dict[str, float] = {}
+_tidal_own_ids_lock = threading.Lock()
+# Long enough to cover a track that started before a token refresh and
+# is still reporting; short enough that the set can't grow unbounded.
+_RECENT_PLAY_SESSION_TTL_SEC = 2 * 60 * 60
+
+
+def _remember_own_session_token(token: Optional[str]) -> None:
+    sid = play_report_session_id(token)
+    if not sid:
+        return
+    with _tidal_own_ids_lock:
+        _tidal_own_ids.add(sid.strip().lower())
+
+
+def _remember_play_report_session(session_id: Optional[str]) -> None:
+    if not session_id:
+        return
+    now = time.monotonic()
+    with _tidal_own_ids_lock:
+        _recent_play_session_ids[str(session_id).strip().lower()] = now
+        cutoff = now - _RECENT_PLAY_SESSION_TTL_SEC
+        for key, ts in list(_recent_play_session_ids.items()):
+            if ts < cutoff:
+                del _recent_play_session_ids[key]
+
+
+def _own_realtime_session_ids() -> set[str]:
+    """Every id the realtime listener should treat as ours."""
+    now = time.monotonic()
+    cutoff = now - _RECENT_PLAY_SESSION_TTL_SEC
+    with _tidal_own_ids_lock:
+        recent = {
+            key for key, ts in _recent_play_session_ids.items() if ts >= cutoff
+        }
+        return recent | _tidal_own_ids
 
 
 def _native_player() -> PCMPlayer:
@@ -7856,6 +7956,7 @@ def realtime_status() -> dict:
             "reconnect_count": 0,
             "events_received": 0,
             "self_events_ignored": 0,
+            "recent_notifications": [],
             "protocol_known": False,
         }
     s = listener.status()
@@ -7865,6 +7966,8 @@ def realtime_status() -> dict:
         "reconnect_count": s.reconnect_count,
         "events_received": s.events_received,
         "self_events_ignored": s.self_events_ignored,
+        "own_ids_tracked": len(_own_realtime_session_ids()),
+        "recent_notifications": s.recent_notifications,
         "protocol_known": listener.is_protocol_known,
     }
 

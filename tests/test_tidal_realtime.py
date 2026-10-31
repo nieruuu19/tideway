@@ -374,3 +374,79 @@ def test_status_snapshot_carries_self_events_ignored():
     )
     asyncio.run(listener._dispatch_frame(_frame("our-sid"), _FakeWS()))
     assert listener.status().self_events_ignored == 1
+
+
+def test_dispatch_ignores_our_playback_session_id():
+    """Tidal's event pipeline can echo our own `playbackSessionId`
+    (the UUID play_reporter stamps on events) instead of the OAuth
+    sid. Both identify us, so both must be filtered."""
+    received: list = []
+    listener = RealtimeListener(
+        token_provider=_noop_token,
+        on_other_device_started=received.append,
+        own_session_ids_provider=lambda: {"sid-a", "playback-uuid"},
+    )
+    asyncio.run(
+        listener._dispatch_frame(
+            {
+                "type": "PRIVILEGED_SESSION_NOTIFICATION",
+                "payload": {
+                    "clientDisplayName": "Android Automotive",
+                    "sessionId": "something-else",
+                    "playbackSessionId": "playback-uuid",
+                },
+            },
+            _FakeWS(),
+        )
+    )
+
+    assert received == []
+    assert listener.status().self_events_ignored == 1
+
+
+def test_plural_provider_matches_any_tracked_id():
+    received: list = []
+    listener = RealtimeListener(
+        token_provider=_noop_token,
+        on_other_device_started=received.append,
+        own_session_ids_provider=lambda: ["sid-old", "sid-new"],
+    )
+    asyncio.run(listener._dispatch_frame(_frame("SID-OLD"), _FakeWS()))
+
+    assert received == []
+    assert listener.status().self_events_ignored == 1
+
+
+def test_pushkin_connection_id_is_treated_as_ours():
+    """The UUID in the minted WS URL identifies our own Pushkin
+    connection; Tidal can name it as the privileged session when
+    echoing our USER_ACTION."""
+    received: list = []
+    listener = RealtimeListener(
+        token_provider=_noop_token,
+        on_other_device_started=received.append,
+    )
+    listener._remember_pushkin_id(
+        "wss://pushkin-v2.tidal.com/public/token/ABC-123/ws"
+    )
+    asyncio.run(listener._dispatch_frame(_frame("abc-123"), _FakeWS()))
+
+    assert received == []
+    assert listener.status().self_events_ignored == 1
+
+
+def test_recent_notifications_survive_in_status_snapshot():
+    listener = RealtimeListener(
+        token_provider=_noop_token,
+        on_other_device_started=_noop_callback,
+        session_id_provider=lambda: "our-sid",
+    )
+    asyncio.run(listener._dispatch_frame(_frame("their-sid", "iOS"), _FakeWS()))
+    asyncio.run(listener._dispatch_frame(_frame("our-sid"), _FakeWS()))
+
+    recent = listener.status().recent_notifications
+    assert [entry["session_id"] for entry in recent] == ["their-sid", "our-sid"]
+    assert recent[0]["client_display_name"] == "iOS"
+    assert recent[0]["matched_own_id"] is False
+    assert recent[1]["matched_own_id"] is True
+    assert recent[0]["own_id_count"] >= 1

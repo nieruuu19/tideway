@@ -28,22 +28,32 @@ def client(tmp_path, monkeypatch):
     server.settings = original_settings
 
 
-def test_clients_lists_the_selectable_table(client):
+def test_clients_lists_only_the_hires_client(client):
     r = client.get("/api/auth/clients")
 
     assert r.status_code == 200
     body = r.json()
-    assert [item["index"] for item in body["clients"]] == [1, 4, 5]
-    assert body["selected"] in (1, 4, 5)
+    assert [item["index"] for item in body["clients"]] == [5]
+    assert body["selected"] == 5
     for item in body["clients"]:
         assert set(item) == {"index", "platform", "formats"}
+
+
+def test_clients_reports_the_hires_client_even_when_settings_are_stale(client):
+    """A settings.json written by an older build can name the TV or Fire
+    TV client; the payload must say what a login would really use."""
+    import server
+
+    server.settings.tidal_api_key_index = 4
+
+    assert client.get("/api/auth/clients").json()["selected"] == 5
 
 
 def test_clients_includes_the_pkce_picker_with_mobile_first(client):
     r = client.get("/api/auth/clients")
 
     body = r.json()
-    assert [item["index"] for item in body["pkce_clients"]] == [0, 1, 4, 5]
+    assert [item["index"] for item in body["pkce_clients"]] == [0, 5]
     assert body["pkce_selected"] == 0
     assert body["pkce_clients"][0]["platform"] == "Tidal mobile app"
     for item in body["pkce_clients"]:
@@ -98,16 +108,24 @@ def test_select_client_reports_reauth(client, monkeypatch):
         lambda index: seen.append(index) or True,
     )
 
-    r = client.post("/api/auth/client", json={"index": 4})
+    r = client.post("/api/auth/client", json={"index": 5})
 
     assert r.status_code == 200
-    assert r.json() == {"ok": True, "index": 4, "reauth_required": True}
-    assert seen == [4]
-    assert server.settings.tidal_api_key_index == 4
+    assert r.json() == {"ok": True, "index": 5, "reauth_required": True}
+    assert seen == [5]
+    assert server.settings.tidal_api_key_index == 5
 
 
 def test_select_client_rejects_unknown_index(client):
     r = client.post("/api/auth/client", json={"index": 999})
+
+    assert r.status_code == 400
+
+
+def test_select_client_rejects_a_retired_client(client):
+    """Index 4 still resolves for stored sessions but must not be
+    selectable again — it cannot complete the code flow."""
+    r = client.post("/api/auth/client", json={"index": 4})
 
     assert r.status_code == 400
 
@@ -127,7 +145,7 @@ def test_picker_is_available_while_signed_out(client, monkeypatch):
 
     assert client.get("/api/auth/clients").status_code == 200
     assert (
-        client.post("/api/auth/client", json={"index": 4}).status_code == 200
+        client.post("/api/auth/client", json={"index": 5}).status_code == 200
     )
     assert (
         client.post("/api/auth/pkce-client", json={"index": 0}).status_code

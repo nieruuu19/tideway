@@ -788,9 +788,14 @@ def _selected_api_key() -> api_keys.ApiKey:
     Read from disk rather than cached: the login UI can change it while
     the server is running, and a stale value would mint the token under
     the wrong client.
+
+    A settings.json written by an older build can still name a retired
+    client (the TV or legacy Fire TV pair). Those no longer complete a
+    login, so they fall back to the hi-res default instead of minting a
+    token nothing can play.
     """
     key = api_keys.get_item(load_settings().tidal_api_key_index)
-    if key is None:
+    if key is None or key.index != api_keys.DEFAULT_API_KEY_INDEX:
         key = api_keys.get_item(api_keys.DEFAULT_API_KEY_INDEX)
     assert key is not None
     return key

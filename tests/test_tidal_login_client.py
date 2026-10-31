@@ -63,14 +63,27 @@ def settings_store(monkeypatch):
 
 
 def test_start_oauth_login_applies_selected_client(settings_store):
+    client = _skeleton()
+
+    client.start_oauth_login()
+
+    hires = api_keys.get_item(5)
+    assert client.session.seen_login == (hires.client_id, hires.client_secret)
+    assert client._device_code_index == 5
+
+
+def test_start_oauth_login_ignores_a_retired_client(settings_store):
+    """settings.json from an older build can still name the Fire TV
+    client; only HiRes completes a login now, so a stored 1 must not
+    mint a token nothing can play."""
     settings_store["settings"].tidal_api_key_index = 1
     client = _skeleton()
 
     client.start_oauth_login()
 
-    fire_tv = api_keys.get_item(1)
-    assert client.session.seen_login == (fire_tv.client_id, fire_tv.client_secret)
-    assert client._device_code_index == 1
+    hires = api_keys.get_item(5)
+    assert client.session.seen_login == (hires.client_id, hires.client_secret)
+    assert client._device_code_index == 5
 
 
 def test_select_api_key_persists_and_signs_out_device_session(settings_store):
