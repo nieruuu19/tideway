@@ -47,12 +47,17 @@ def test_float_output_policy(monkeypatch, platform, exclusive, expected):
 # --- wiring ------------------------------------------------------------------
 
 
+class _FakeStream:
+    pass
+
+
 class _FakeDecoder:
     """Records set_target_rate calls and mirrors Decoder's dtype rules."""
 
     def __init__(self, rate: int = 44100, sd_dtype: str = "int16"):
         self.sample_rate = rate
         self.output_sample_rate = rate
+        self.source_channels = 2
         self.channels = 2
         self.sounddevice_dtype = sd_dtype
         self.calls: list[tuple[int, bool]] = []
@@ -81,7 +86,7 @@ def _open(monkeypatch, *, platform, exclusive, fail_exclusive=False):
         if fail_exclusive and "extra_settings" in kwargs:
             raise RuntimeError("device refused the format")
         opened.append(kwargs)
-        return object()
+        return _FakeStream()
 
     monkeypatch.setattr(player.sd, "OutputStream", fake_output_stream)
     monkeypatch.setattr(
@@ -142,8 +147,10 @@ def test_load_pipeline_matches_a_float_shared_stream(monkeypatch):
     monkeypatch.setattr(
         p, "_resolve_source", lambda tid, q: ("track.flac", 1.0, None, None, None)
     )
-    monkeypatch.setattr(p, "_open_stream_source", lambda spec, pre: spec)
-    monkeypatch.setattr(player, "Decoder", lambda source: dec)
+    monkeypatch.setattr(
+        p, "_open_stream_source", lambda spec, pre, sink=None: spec
+    )
+    monkeypatch.setattr(player, "Decoder", lambda source, surround=False: dec)
     pipeline = p._build_load_pipeline("t1", None, match_rate=44100)
     pipeline.stop_flag.set()
     pipeline.thread.join(timeout=2)

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { Heart, Music, Video as VideoIcon } from "lucide-react";
 import { api } from "@/api/client";
@@ -9,6 +9,7 @@ import { queryKeys } from "@/api/queryKeys";
 import { useColumnCount } from "@/hooks/useColumnCount";
 import { useLikedByArtist } from "@/hooks/useLikedByArtist";
 import { useSpotifyTrackPlaycountBatch } from "@/hooks/useSpotifyEnrichment";
+import { useTrackPrefetch } from "@/hooks/useTrackPrefetch";
 import { useVideoPlayer } from "@/hooks/useVideoPlayer";
 import { excludeCompilations } from "./ArtistSection";
 import { ArtistHero } from "@/components/ArtistHero";
@@ -57,6 +58,16 @@ export function ArtistDetail({ onDownload }: { onDownload: OnDownload }) {
   // request, instead of letting each TrackList row fire its own.
   // Same fix as AlbumDetail; see hook for cost / benefit detail.
   useSpotifyTrackPlaycountBatch(artist?.top_tracks);
+  // Warm the stream-manifest cache for the popular tracks, same as an
+  // opened album. An artist page is a list of songs people click
+  // straight through; without this the first click on each row waits
+  // on the Tidal resolve while hover-prefetch races to catch up.
+  const { prefetchMany } = useTrackPrefetch();
+  useEffect(() => {
+    if (artist?.top_tracks?.length) {
+      prefetchMany(artist.top_tracks.slice(0, 10).map((t) => t.id));
+    }
+  }, [artist, prefetchMany]);
 
   if (loading) {
     return (

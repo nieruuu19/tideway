@@ -67,14 +67,21 @@ into them from the loop is fine; we don't need a thread hop.
 ## Self-event filtering
 
 The web client's frame handler pauses unconditionally on every
-`PRIVILEGED_SESSION_NOTIFICATION` — no self-filter by sessionId.
-This works in practice because Tidal's backend doesn't echo a
-client's own session events back to that same client's connection.
-We follow the same posture: pause callback fires unconditionally;
-trust the server to not push our own events to us. If we ever see
-self-pause from a Tideway-only-playing scenario, the fix is to
-compare against the sessionId play_reporter generated for the
-active session.
+`PRIVILEGED_SESSION_NOTIFICATION`. That works for the web client
+because it is an observer, but Tideway both sends its own playback
+events (`play_reporter`) and sends `USER_ACTION` when local playback
+starts. Tidal's backend echoes that back to us as a
+`PRIVILEGED_SESSION_NOTIFICATION` whose `clientDisplayName` is our own
+client (e.g. "Android Automotive"), which used to make Tideway pause
+itself the moment it started playing.
+
+The frame carries `payload.sessionId`, and our access token's JWT
+carries our own session id in the `sid` claim (the same claim
+`play_reporter` reports as `user.sessionId`). A notification whose
+`sessionId` equals our `sid` is our own echo, so it is counted in
+`self_events_ignored` and never reaches the pause callback. The
+provider is optional: without one, every notification is treated as
+another device's, which is the old behavior.
 """
 from __future__ import annotations
 
@@ -121,6 +128,12 @@ _CONNECT_TIMEOUT_SEC = 10.0
 # time it (re)connects rather than caching once.
 TokenProvider = Callable[[], Optional[str]]
 
+# Function the listener calls to obtain the current Tidal session id
+# (the `sid` claim of the access token). Used to recognise Pushkin
+# echoing our own playback events back at us. Returning None means
+# "can't tell", in which case notifications are delivered as before.
+SessionIdProvider = Callable[[], Optional[str]]
+
 # Callback fired when another device on the same account starts
 # playing. The desktop launcher binds this to PCMPlayer.pause(). The
 # callback runs on the asyncio loop and may be sync or async.
@@ -144,6 +157,11 @@ class ListenerStatus:
     # callback since start(). Useful sanity check that the wire-up
     # is working when capturing fresh fixtures.
     events_received: int = 0
+    # How many notifications were dropped because their sessionId
+    # matched our own token's session id — i.e. Tidal echoing our own
+    # playback back at us. A non-zero value next to events_received=0
+    # means the self-filter is doing its job.
+    self_events_ignored: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +180,9 @@ class RealtimeListener:
 
     token_provider: TokenProvider
     on_other_device_started: OtherDeviceStartedCallback
+    # Optional. Without it, every PRIVILEGED_SESSION_NOTIFICATION is
+    # treated as another device's (no self-filter).
+    session_id_provider: Optional[SessionIdProvider] = None
 
     # Internal state. Not user-tunable.
     _task: Optional[asyncio.Task] = field(default=None, init=False)
@@ -212,6 +233,7 @@ class RealtimeListener:
             last_error=self._status.last_error,
             reconnect_count=self._status.reconnect_count,
             events_received=self._status.events_received,
+            self_events_ignored=self._status.self_events_ignored,
         )
 
     # -- internals ----------------------------------------------------------
@@ -343,6 +365,23 @@ class RealtimeListener:
                 # re-populate this on the next successful connect.
                 self._ws = None
 
+    def _own_session_id(self) -> Optional[str]:
+        """Our current Tidal session id, or None when unknown.
+
+        Best-effort: a provider that raises or returns garbage must
+        not break the receive loop. Treating it as unknown falls back
+        to delivering the notification.
+        """
+        provider = self.session_id_provider
+        if provider is None:
+            return None
+        try:
+            value = provider()
+        except Exception:
+            log.exception("tidal_realtime: session_id_provider raised")
+            return None
+        return str(value) if value else None
+
     async def _dispatch_frame(self, frame: dict, ws) -> None:
         """Route a parsed frame to the right action.
 
@@ -352,8 +391,18 @@ class RealtimeListener:
         """
         frame_type = frame.get("type")
         if frame_type == "PRIVILEGED_SESSION_NOTIFICATION":
-            self._status.events_received += 1
             payload = frame.get("payload") or {}
+            event_sid = payload.get("sessionId")
+            own_sid = self._own_session_id()
+            if own_sid and event_sid and event_sid == own_sid:
+                self._status.self_events_ignored += 1
+                log.info(
+                    "tidal_realtime: ignoring our own session "
+                    "notification (sid=%s); not pausing",
+                    own_sid,
+                )
+                return
+            self._status.events_received += 1
             log.info(
                 "tidal_realtime: PRIVILEGED_SESSION_NOTIFICATION "
                 "from %s; firing pause callback",
@@ -477,6 +526,7 @@ def get_listener() -> Optional[RealtimeListener]:
 def start_listener(
     token_provider: TokenProvider,
     on_other_device_started: OtherDeviceStartedCallback,
+    session_id_provider: Optional[SessionIdProvider] = None,
 ) -> RealtimeListener:
     """Construct (or reuse) the module-level listener and start it.
 
@@ -489,6 +539,7 @@ def start_listener(
         _listener = RealtimeListener(
             token_provider=token_provider,
             on_other_device_started=on_other_device_started,
+            session_id_provider=session_id_provider,
         )
     _listener.start()
     return _listener

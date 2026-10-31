@@ -20,6 +20,7 @@ Pinned contracts:
 """
 import pytest
 from fastapi import HTTPException
+from types import SimpleNamespace
 
 
 @pytest.fixture(autouse=True)
@@ -146,6 +147,68 @@ def test_playlist_detail_caches_within_ttl(stub_auth, monkeypatch):
     r2 = server.playlist_detail("p1")
     assert r1 == r2
     assert calls["n"] == 1
+
+
+def test_track_is_streamable_only_hides_explicit_false():
+    import server
+
+    assert server._track_is_streamable({"streamReady": True, "allowStreaming": True})
+    assert server._track_is_streamable({"id": 1})
+    assert not server._track_is_streamable({"streamReady": False})
+    assert not server._track_is_streamable({"allowStreaming": False})
+    assert server._track_is_streamable(
+        SimpleNamespace(available=True, stream_ready=None, allow_streaming=None)
+    )
+    assert not server._track_is_streamable(
+        SimpleNamespace(available=True, stream_ready=False, allow_streaming=False)
+    )
+
+
+def test_playlist_detail_hides_tracks_tidal_will_not_stream(stub_auth, monkeypatch):
+    """Tidal leaves dead entries in playlist items and its own client
+    hides them. Clicking one used to fail with "asset not ready"; the
+    detail endpoint now drops them before the queue ever sees them.
+    """
+    import server
+
+    rows = [
+        {
+            "item": {"id": 1, "title": "Playable", "streamReady": True, "allowStreaming": True},
+            "created": "2026-01-01T00:00:00.000Z",
+        },
+        {
+            "item": {"id": 2, "title": "Gone", "streamReady": False, "allowStreaming": False},
+            "created": None,
+        },
+        {
+            "item": {"id": 3, "title": "Also gone", "streamReady": False, "allowStreaming": False},
+            "created": None,
+        },
+    ]
+
+    class _Resp:
+        def json(self):
+            return {"items": rows}
+
+    monkeypatch.setattr(
+        server.tidal.session.request, "request", lambda *a, **k: _Resp()
+    )
+    monkeypatch.setattr(
+        server.tidal.session,
+        "parse_track",
+        lambda raw: SimpleNamespace(id=raw["id"], name=raw["title"]),
+    )
+    monkeypatch.setattr(
+        server,
+        "track_to_dict",
+        lambda t: {"kind": "track", "id": str(t.id), "name": t.name},
+    )
+    monkeypatch.setattr(server.tidal.session, "playlist", lambda _id: _StubPlaylist(name="Mix"))
+    monkeypatch.setattr(server, "playlist_to_dict", lambda p: {"name": p.name})
+
+    out = server.playlist_detail("p1")
+
+    assert [t["id"] for t in out["tracks"]] == ["1"]
 
 
 def test_album_id_and_mix_id_with_same_value_dont_collide(stub_auth, monkeypatch):

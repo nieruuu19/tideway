@@ -249,3 +249,6 @@ watchlist.json
 # flatpak-builder runs locally; never check in either)
 .flatpak-builder/
 .build-flatpak/
+
+# Local TIDAL OAuth client credentials — never commit
+app/api_keys.py

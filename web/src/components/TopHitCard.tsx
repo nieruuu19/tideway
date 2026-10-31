@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { Music, Play } from "lucide-react";
 import type { Track, TopHit } from "@/api/types";
+import { AtmosBadge } from "@/components/AtmosBadge";
 import { PlayMediaButton } from "@/components/PlayMediaButton";
 import { usePlayerActions } from "@/hooks/PlayerContext";
 import { cn, imageUrl } from "@/lib/utils";
@@ -86,10 +87,13 @@ export function TopHitCard({
             <Subtitle hit={hit} onNavigate={navigate} />
           </div>
         )}
-        <div className="mt-3">
+        <div className="mt-3 flex items-center gap-2">
           <span className="inline-flex rounded-full bg-secondary px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
             {KIND_LABEL[hit.kind]}
           </span>
+          {(hit.kind === "track" || hit.kind === "album") && hit.is_atmos && (
+            <AtmosBadge />
+          )}
         </div>
       </div>
     </>

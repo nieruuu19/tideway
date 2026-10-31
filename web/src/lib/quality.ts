@@ -7,10 +7,8 @@ import type { QualityOption, Track } from "@/api/types";
  *   "Same as High" CD-res only → picking Max wastes bandwidth
  * null for all other quality tiers.
  *
- * Immersive audio (Dolby Atmos / Sony 360 / MQA) isn't surfaced:
- * Tidal only streams those to authorized-partner client_ids, and our
- * PKCE session always gets a stereo FLAC downmix. Exposing the
- * distinction would mislead users.
+ * Dolby Atmos is its own download tier (see the Atmos entry in
+ * /api/qualities), so this stereo-tier annotation stays out of it.
  */
 export function effectiveFormatLabel(
   quality: string,

@@ -4,12 +4,10 @@ import { cn } from "@/lib/utils";
 /**
  * Audio-format filter chip row for Library / Search results.
  *
- * Scope is limited to what we can actually deliver: Max (24-bit FLAC)
- * and Lossless (FLAC CD). Atmos / Sony 360 / MQA tags exist in Tidal's
- * catalog but Tidal only serves the immersive streams to authorized-
- * partner client_ids — our PKCE session gets a stereo FLAC downmix no
- * matter what. Exposing chips for formats we can't deliver would just
- * confuse users.
+ * Scope is limited to what the filter can tell apart from media_tags:
+ * Max (24-bit FLAC) and Lossless (FLAC CD). Dolby Atmos is a separate
+ * catalog edition, not a tag on the stereo release, so it's surfaced
+ * with the Atmos badge on the row itself instead of a chip here.
  */
 
 export type AudioFormat = "all" | "hires" | "lossless";

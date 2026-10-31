@@ -14,7 +14,7 @@ during this load" from "a fresh load that should start". The pause was
 silently discarded and the track started anyway — the button did
 nothing, which is the shape of the "pause feels dead" reports.
 
-These tests drive `play_track()` against a stand-in `load` that
+These tests drive `play_track()` against a stand-in `_load_locked` that
 reproduces the real one's observable contract: transition to "loading",
 open a stream, clear `_paused`, land in "paused". The internals of the
 real load are covered elsewhere; what matters here is what
@@ -44,11 +44,13 @@ def _player() -> PCMPlayer:
 
 
 def _install_fake_load(p: PCMPlayer, stream: _FakeStream, during_load=None):
-    """Replace `load` with one that mirrors `_load_locked`'s visible
-    effects. `during_load` runs at the point the real resolve would be
-    in flight — the window in which a pause can land."""
+    """Replace `_load_locked` with one that mirrors the real load's
+    visible effects. `during_load` runs at the point the real resolve
+    would be in flight — the window in which a pause can land.
+    `play_track()` claims its load sequence before the lock and calls
+    `_load_locked` with it, so that is the seam to stand in for."""
 
-    def fake_load(track_id: str, quality=None):
+    def fake_load(track_id: str, quality=None, load_seq=None):
         with p._lock:
             p._transition("loading", track_id=track_id)
         if during_load is not None:
@@ -61,7 +63,7 @@ def _install_fake_load(p: PCMPlayer, stream: _FakeStream, during_load=None):
             p._transition("paused")
         return p.snapshot()
 
-    p.load = fake_load  # type: ignore[method-assign]
+    p._load_locked = fake_load  # type: ignore[method-assign]
 
 
 def test_pause_during_load_leaves_playback_stopped():

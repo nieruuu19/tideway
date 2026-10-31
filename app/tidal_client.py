@@ -11,12 +11,16 @@ import webbrowser
 from concurrent.futures import Future
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Optional, Tuple
+from types import SimpleNamespace
+from typing import Any, Callable, Optional, Tuple
 
 import tidalapi
 
+from app import api_keys
+from app import lossless as lossless_mod
 from app.http import network_error_classes
 from app.paths import user_data_dir
+from app.settings import load_settings, save_settings
 
 # audio.log is bound to the "tideway.audio" logger in
 # app/audio/player.py (a RotatingFileHandler, propagate=False).
@@ -276,41 +280,66 @@ _track_ai_patched = False
 
 
 def _patch_track_ai_field() -> None:
-    """Teach tidalapi's Track parser to keep the `ai` flag.
-
-    Tidal tags every 100% AI-generated track with a top-level `ai`
-    boolean on the track payload (its July 2026 AI-content policy).
-    tidalapi 0.8.11 parses ~30 track fields but drops this one and
-    retains no raw JSON, so without this patch the flag never reaches
-    Python and the AI-content filter has nothing to act on. Wrap
-    parse_track so the returned Track carries `ai`; a class-level
-    default of None keeps `getattr(track, "ai", None)` safe on any
-    Track built before the wrapper ran.
-
-    Class-level and idempotent: Track objects are created deep inside
-    tidalapi, so an instance patch can't reach them, and the login
-    flow rebuilds the Session more than once.
+    """Teach tidalapi's Track & Album parsers to keep the `ai` flag,
+    Dolby Atmos metadata (`audioModes` / `mediaMetadata.tags`), and
+    Tidal's per-track availability flags (`streamReady` /
+    `allowStreaming`) so listings can hide what Tidal won't play.
     """
     global _track_ai_patched
     if _track_ai_patched:
         return
-    from tidalapi.media import Track
+    from tidalapi.media import Track, Album
 
-    original = Track.parse_track
+    original_track = Track.parse_track
     Track.ai = None
+    Track.audio_modes = []
+    Track.media_metadata_tags = []
+    Track.is_dolby_atmos = False
+    Track.stream_ready = None
+    Track.allow_streaming = None
 
-    def parse_track_with_ai(self, json_obj, album=None):
-        track = original(self, json_obj, album)
+    def parse_track_with_ai_and_atmos(self, json_obj, album=None):
+        track = original_track(self, json_obj, album)
         ai = bool(json_obj.get("ai")) if "ai" in json_obj else None
-        # parse_track returns copy.copy(self), and the two callers keep
-        # different objects: list parsing (map_json) uses the returned
-        # copy, but Track.__init__ discards _get's return and keeps
-        # `self`. Set the flag on both so either path carries it.
-        track.ai = ai
-        self.ai = ai
+        audio_modes = list(json_obj.get("audioModes") or [])
+        meta_tags = list((json_obj.get("mediaMetadata") or {}).get("tags") or [])
+        is_atmos = (
+            "DOLBY_ATMOS" in audio_modes
+            or "DOLBY_ATMOS" in meta_tags
+            or getattr(self, "audio_mode", None) == "DOLBY_ATMOS"
+        )
+        stream_ready = json_obj.get("streamReady")
+        allow_streaming = json_obj.get("allowStreaming")
+        for target in (track, self):
+            target.ai = ai
+            target.audio_modes = audio_modes
+            target.media_metadata_tags = meta_tags
+            target.is_dolby_atmos = is_atmos
+            target.stream_ready = stream_ready
+            target.allow_streaming = allow_streaming
         return track
 
-    Track.parse_track = parse_track_with_ai
+    Track.parse_track = parse_track_with_ai_and_atmos
+
+    if hasattr(Album, "parse_album"):
+        original_album = Album.parse_album
+        Album.audio_modes = []
+        Album.media_metadata_tags = []
+        Album.is_dolby_atmos = False
+
+        def parse_album_with_atmos(self, json_obj, artist=None, artists=None):
+            alb = original_album(self, json_obj, artist, artists)
+            audio_modes = list(json_obj.get("audioModes") or [])
+            meta_tags = list((json_obj.get("mediaMetadata") or {}).get("tags") or [])
+            is_atmos = "DOLBY_ATMOS" in audio_modes or "DOLBY_ATMOS" in meta_tags
+            for target in (alb, self):
+                target.audio_modes = audio_modes
+                target.media_metadata_tags = meta_tags
+                target.is_dolby_atmos = is_atmos
+            return alb
+
+        Album.parse_album = parse_album_with_atmos
+
     _track_ai_patched = True
 
 
@@ -490,34 +519,291 @@ _SUB_QUALITY_MAP = {
     "LOSSLESS": "high_lossless",
     "HI_RES_LOSSLESS": "hi_res_lossless",
     # Tidal's current single-tier subscription reports `HI_RES` as the
-    # `highestSoundQuality`, which DOES include hi-res FLAC (Max). The
-    # catch: only a PKCE-authenticated session's access_token is
-    # entitled to stream it — device-code sessions 401 at Max even
-    # though the subscription allows it. We therefore translate HI_RES
-    # to hi_res_lossless ONLY when the session is PKCE; for device-code
-    # sessions we fall back to high_lossless so the UI doesn't offer
-    # an unreachable option. See get_max_quality() below.
+    # `highestSoundQuality`, which includes hi-res FLAC (Max). Whether a
+    # session can actually stream it depends on the OAuth client that
+    # minted the token, not on the login flow: the Tidal HiRes client
+    # (api_keys index 5) serves HI_RES_LOSSLESS over
+    # `playbackinfopostpaywall` even for device-code sessions, while the
+    # legacy `urlpostpaywall` endpoint answers AAC for every tier. See
+    # `request_stream_manifest()`.
     "HI_RES": "hi_res_lossless",
     "MASTER": "hi_res_lossless",
     "HIFI": "high_lossless",
     "HIFI_PLUS": "hi_res_lossless",
 }
 
-# Client-level ceiling: even if the subscription says Max, the device-code
-# OAuth client_id is capped at Lossless. Only the PKCE client is entitled
-# for hi-res.
-_DEVICE_CODE_MAX = "high_lossless"
+# What `Stream.audio_quality` says TIDAL actually served, mapped onto the
+# internal tier names used everywhere else.
+_DELIVERED_QUALITY_MAP = {
+    "LOW": "low_96k",
+    "HIGH": "low_320k",
+    "LOSSLESS": "high_lossless",
+    "HI_RES_LOSSLESS": "hi_res_lossless",
+}
+_LOSSY_TIERS = frozenset({"low_96k", "low_320k"})
+_LOSSLESS_TIERS = frozenset({"high_lossless", "hi_res_lossless"})
 
 
-# Device-code (Limited Input Device) credentials. tidalapi 0.8.x ships a
-# default client_id that Tidal has revoked Limited Input Device
-# entitlement on; calling /v1/oauth2/device_authorization with it now
-# 400s with `Client is not a Limited Input Device client`. The legacy
-# tidalapi <=0.7.x default — Tidal's "TV" client — still has the
-# entitlement, so we override at TidalClient construction. PKCE uses
-# `client_id_pkce`, which we leave on tidalapi's bundled value.
-_DEVICE_CODE_CLIENT_ID = "zU4XHVVkc2tDPo4t"
-_DEVICE_CODE_CLIENT_SECRET = "VJKhDFqJPqvsPVNBV6ukXTJmwlvbttP7wlMlrc72se4="
+def delivered_quality(stream) -> Optional[str]:
+    """The tier TIDAL actually served, read off the Stream object.
+
+    None means TIDAL didn't say; callers treat that as "assume asked".
+    """
+    raw = getattr(stream, "audio_quality", None)
+    if raw is None:
+        return None
+    return _DELIVERED_QUALITY_MAP.get(str(getattr(raw, "value", raw)).upper())
+
+
+def is_lossy_quality(tier: Optional[str]) -> bool:
+    """True for the AAC tiers; None (unknown) reports False."""
+    return tier in _LOSSY_TIERS
+
+
+class TidalAssetUnavailable(RuntimeError):
+    """TIDAL knows this track but is not serving it for playback.
+
+    HTTP 401/403 carrying subStatus 4005 ("Asset is not ready for
+    playback") — a per-track licensing/regional refusal, not a stale
+    token. Refreshing the session cannot fix it, so it must not be
+    routed through the auth-recovery path.
+    """
+
+
+def _is_auth_status(exc: Exception) -> bool:
+    resp = getattr(exc, "response", None)
+    return getattr(resp, "status_code", None) in (401, 403)
+
+
+def _is_asset_unavailable(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    if getattr(response, "status_code", None) not in (401, 403):
+        return False
+    try:
+        text = str(getattr(response, "text", None) or "")
+    except Exception:
+        text = ""
+    text = text.lower()
+    return "4005" in text or "not ready for playback" in text
+
+
+def _flac_fallback(
+    session, track, requested, served: Optional[str]
+) -> Optional[Tuple[Any, Any, str]]:
+    """Resolve the OpenAPI FLAC manifest when v1 handed back AAC.
+
+    Returns a `(stream, manifest, delivered_tier)` triple shaped like
+    the v1 pair (only the attributes callers read), or None when this
+    track/login has no playable FLAC — the caller then keeps the honest
+    AAC stream. Subscription-tier mapping is left alone: the tier this
+    returns is the one the returned bytes actually are.
+    """
+    track_id = getattr(track, "id", None)
+    if track_id is None:
+        return None
+    try:
+        asset = lossless_mod.fetch_lossless_stream(
+            session,
+            int(track_id),
+            hi_res=requested == tidalapi.Quality.hi_res_lossless,
+        )
+    except lossless_mod.LosslessUnavailable as exc:
+        _tlog(
+            f"track {track_id}: TIDAL served {served!r} for a lossless "
+            f"request and has no playable FLAC ({exc})"
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001 - never lose the AAC stream
+        # A broken/odd session (unit-test doubles), a 401 for a client
+        # that isn't entitled to the OpenAPI route, or a transient 5xx:
+        # the v1 stream already succeeded, so fall back to it rather
+        # than failing the play.
+        _tlog(
+            f"track {track_id}: FLAC manifest lookup failed "
+            f"({type(exc).__name__}: {exc}); keeping {served!r}"
+        )
+        return None
+
+    tier = asset.tier
+    stream = SimpleNamespace(
+        audio_quality="HI_RES_LOSSLESS" if asset.is_hi_res else "LOSSLESS",
+        bit_depth=asset.bit_depth,
+        sample_rate=asset.sample_rate,
+        audio_mode=None,
+        track_replay_gain=asset.track_replay_gain,
+        track_peak_amplitude=asset.track_peak,
+        album_replay_gain=asset.album_replay_gain,
+        album_peak_amplitude=asset.album_peak,
+    )
+    manifest = SimpleNamespace(
+        urls=list(asset.urls),
+        codecs=asset.codec,
+        file_extension="flac",
+        is_encrypted=False,
+        get_codecs=lambda: asset.codec,
+    )
+    _tlog(
+        f"track {track_id}: TIDAL served {served!r} for a lossless "
+        f"request; playing {tier!r} FLAC from the OpenAPI manifest "
+        f"({asset.bit_depth or '?'}-bit {asset.sample_rate or '?'} Hz, "
+        f"{len(asset.urls) - 1} segments)"
+    )
+    return stream, manifest, tier
+
+
+def request_stream_manifest(
+    session, track
+) -> Tuple[Any, Any, Optional[str]]:
+    """Resolve `(stream, manifest, delivered_tier)` at the tier currently
+    set on `session.config.quality`.
+
+    `tracks/{id}/playbackinfopostpaywall` is the only endpoint that
+    serves lossless to a device-code session — the legacy
+    `urlpostpaywall` behind `Track.get_url()` answers AAC 320 for every
+    tier, which is why stereo "Lossless"/"Max" downloads used to land as
+    `.m4a` AAC files. Two TIDAL behaviours get smoothed over here:
+
+    * `LOSSLESS` can come back as AAC (`HIGH`) on clients that don't
+      serve the CD tier. A lossless request that renders lossy goes
+      straight to the OpenAPI `trackManifests` route for FLAC (see
+      `_flac_fallback`), which serves the same master — that route is
+      what makes "Lossless"/"Max" actually play FLAC on clients whose v1
+      tier negotiation answers AAC.
+    * Only when that route has no playable FLAC is the v1 stream
+      retried once at `HI_RES_LOSSLESS`, which some clients do serve
+      even though the CD tier answers AAC.
+    * `HI_RES_LOSSLESS` on a client that isn't entitled answers 401/403.
+      Retried once at `LOSSLESS` so the stream lands instead of failing.
+
+    Rate limits and auth errors that survive the fallback propagate —
+    the caller's refresh / backoff path owns those.
+    """
+    requested = session.config.quality
+    wants_lossless = requested in (
+        tidalapi.Quality.high_lossless,
+        tidalapi.Quality.hi_res_lossless,
+    )
+    hi_res_blocked = False
+    try:
+        stream = track.get_stream()
+    except Exception as exc:
+        if _is_asset_unavailable(exc):
+            raise TidalAssetUnavailable(
+                "TIDAL isn't serving this track for playback "
+                "(asset not ready)."
+            ) from exc
+        if not (
+            _is_auth_status(exc)
+            and requested == tidalapi.Quality.hi_res_lossless
+        ):
+            raise
+        hi_res_blocked = True
+        print(
+            f"[tidal] hi-res refused for track "
+            f"{getattr(track, 'id', '?')}; falling back to lossless",
+            file=sys.stderr,
+            flush=True,
+        )
+        session.config.quality = tidalapi.Quality.high_lossless
+        try:
+            stream = track.get_stream()
+        except Exception as fallback_exc:
+            if _is_asset_unavailable(fallback_exc):
+                raise TidalAssetUnavailable(
+                    "TIDAL isn't serving this track for playback "
+                    "(asset not ready)."
+                ) from fallback_exc
+            raise
+        finally:
+            session.config.quality = requested
+
+    delivered = delivered_quality(stream)
+    if wants_lossless and delivered in _LOSSY_TIERS:
+        # Asked first, before another v1 round-trip: the OpenAPI route
+        # is the one that reliably serves FLAC on clients whose v1 tier
+        # negotiation answers AAC, and it costs a single request. The
+        # hi-res v1 retry below costs a full request of its own and on
+        # those same clients answers AAC again — so spending it first
+        # doubled (and with the retry's own fallback, tripled) the API
+        # cost of every track. A fast album click-through then tripped
+        # TIDAL's rate limit, which suspends playback for a minute.
+        fallback = _flac_fallback(session, track, requested, delivered)
+        if fallback is not None:
+            return fallback
+
+    if (
+        wants_lossless
+        and not hi_res_blocked
+        and delivered in _LOSSY_TIERS
+        and requested != tidalapi.Quality.hi_res_lossless
+    ):
+        # The FLAC route was unavailable (entitlement, region, or no
+        # FLAC asset). Hi-res is the v1 tier these sessions do serve,
+        # so try it before accepting the AAC.
+        session.config.quality = tidalapi.Quality.hi_res_lossless
+        try:
+            alt = track.get_stream()
+        except Exception as exc:
+            print(
+                f"[tidal] hi-res upgrade failed for track "
+                f"{getattr(track, 'id', '?')}: {exc!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+            alt = None
+        finally:
+            session.config.quality = requested
+        alt_tier = delivered_quality(alt) if alt is not None else None
+        if alt is not None and alt_tier in _LOSSLESS_TIERS:
+            print(
+                f"[tidal] track {getattr(track, 'id', '?')}: TIDAL served "
+                f"{delivered!r} for a lossless request; upgraded to "
+                f"{alt_tier!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+            stream, delivered = alt, alt_tier
+
+    return stream, stream.get_stream_manifest(), delivered
+
+
+# Device-code (Limited Input Device) credentials. The selectable clients
+# live in app/api_keys.py (tidekeeper's table); the user picks one on the
+# login screen and it is persisted in settings.json. This pair is only
+# the fallback for sessions minted before that choice existed: tokens are
+# bound to their issuing client, so such a session must keep refreshing
+# under the old TV client or TIDAL rejects it (4022).
+_LEGACY_DEVICE_CODE_CLIENT_ID = "zU4XHVVkc2tDPo4t"
+_LEGACY_DEVICE_CODE_CLIENT_SECRET = "VJKhDFqJPqvsPVNBV6ukXTJmwlvbttP7wlMlrc72se4="
+
+
+def _apply_client(config: Any, key: api_keys.ApiKey) -> None:
+    config.client_id = key.client_id
+    config.client_secret = key.client_secret
+
+
+def _selected_api_key() -> api_keys.ApiKey:
+    """Client chosen on the login screen for the device-code flow.
+
+    Read from disk rather than cached: the login UI can change it while
+    the server is running, and a stale value would mint the token under
+    the wrong client.
+    """
+    key = api_keys.get_item(load_settings().tidal_api_key_index)
+    if key is None:
+        key = api_keys.get_item(api_keys.DEFAULT_API_KEY_INDEX)
+    assert key is not None
+    return key
+
+
+def _selected_pkce_key() -> Optional[api_keys.ApiKey]:
+    """Client chosen for the PKCE login.
+
+    None means tidalapi's built-in mobile pair, which stays the default
+    because it is the one known to be entitled for Max.
+    """
+    index = getattr(load_settings(), "tidal_pkce_client_index", 0)
+    return api_keys.get_item(index)
 
 
 class TidalClient:
@@ -533,12 +819,30 @@ class TidalClient:
 
     def __init__(self):
         config = tidalapi.Config(quality=tidalapi.Quality.high_lossless)
-        # Pin the device-code client_id to the legacy "TV" client that
-        # still has Limited Input Device entitlement. tidalapi's
-        # bundled default has been revoked by Tidal — see the constants
-        # above. PKCE uses `client_id_pkce`, untouched by this override.
-        config.client_id = _DEVICE_CODE_CLIENT_ID
-        config.client_secret = _DEVICE_CODE_CLIENT_SECRET
+        # Device-code client picked on the login screen. Re-applied on
+        # every load (see `_restore_device_client`) because a token can
+        # only be refreshed by the client that minted it. The PKCE pair
+        # is overridden separately by `_apply_pkce_client`.
+        initial_key = _selected_api_key()
+        self._device_code_index: Optional[int] = initial_key.index
+        _apply_client(config, initial_key)
+        # tidalapi's built-in PKCE pair, kept so a session minted under
+        # an api_keys client can be reverted cleanly.
+        self._pkce_default_client = (
+            config.client_id_pkce,
+            config.client_secret_pkce,
+        )
+        # Client index currently applied to the PKCE pair; None until
+        # `_apply_pkce_client` runs (or the default is in force).
+        self._pkce_client_index: Optional[int] = None
+        # Client behind the cached authorization URL. The pasted code is
+        # bound to it, so the exchange must use the same pair even if the
+        # setting changed in between.
+        self._pkce_url_client_index: Optional[int] = None
+        # Client that minted the persisted PKCE token, written to the
+        # session file so a relaunch refreshes under the same pair.
+        self._session_pkce_client_index: Optional[int] = None
+        self._pkce_url_cache: Optional[tuple[str, float]] = None
         self.session = tidalapi.Session(config)
         _install_tidal_request_gate(self.session)
         _swap_to_impersonated_transport(self.session)
@@ -595,6 +899,56 @@ class TidalClient:
     # Session persistence
     # ------------------------------------------------------------------
 
+    def _restore_device_client(self, stored_index: Any) -> None:
+        """Re-pin the client that minted a persisted device-code token.
+
+        TIDAL rejects a refresh under a different client id (4022), and
+        the manifest gateway keys delivery (DRM vs. clear) on the same
+        binding, so a session must keep the pair it was issued under.
+        Files written before client selection existed carry no index;
+        those tokens belong to the legacy TV client.
+        """
+        key = api_keys.get_item(stored_index)
+        if key is not None:
+            _apply_client(self.session.config, key)
+            self._device_code_index = key.index
+            return
+        self.session.config.client_id = _LEGACY_DEVICE_CODE_CLIENT_ID
+        self.session.config.client_secret = _LEGACY_DEVICE_CODE_CLIENT_SECRET
+        # Remembered as "unknown" so the next save doesn't claim the
+        # session belongs to the currently selected client.
+        self._device_code_index = None
+
+    def _apply_pkce_client(self, key: Optional[api_keys.ApiKey]) -> None:
+        """Point tidalapi's PKCE pair at `key`; None restores mobile.
+
+        Both the authorization request and the token exchange read
+        `client_id_pkce`, so overriding it here makes the whole flow run
+        under the chosen client. `client_enable_hires` then copies the
+        pair onto the main credentials, which is what later API calls
+        and the refresh path use.
+        """
+        config = self.session.config
+        if key is None:
+            config.client_id_pkce, config.client_secret_pkce = (
+                self._pkce_default_client
+            )
+            return
+        config.client_id_pkce = key.client_id
+        config.client_secret_pkce = key.client_secret
+
+    def _restore_pkce_client(self, stored_index: Any) -> None:
+        """Re-pin the client that minted a persisted PKCE token.
+
+        Same reasoning as `_restore_device_client`: the refresh token is
+        only valid under its issuing client. Files written before the
+        choice existed (and sessions left on the mobile default) carry
+        no index and fall back to tidalapi's built-in pair.
+        """
+        key = api_keys.get_item(stored_index)
+        self._apply_pkce_client(key)
+        self._session_pkce_client_index = key.index if key is not None else None
+
     def load_session(self) -> bool:
         if not SESSION_FILE.exists():
             _tlog(f"load_session: no session file at {SESSION_FILE}")
@@ -610,14 +964,19 @@ class TidalClient:
             refresh_token = data.get("refresh_token")
             is_pkce = bool(data.get("is_pkce", False))
             refreshed_on_launch = False
-            # For PKCE sessions, swap the client_id to the hi-res-entitled
-            # one BEFORE any Tidal call. Otherwise the /sessions call
+            # For PKCE sessions, swap the client_id to the one that minted
+            # the token BEFORE any Tidal call. Otherwise the /sessions call
             # inside load_oauth_session (and the proactive refresh below)
-            # would run under the device-code client_id and the resulting
-            # tokens/session wouldn't be entitled for Max quality.
+            # would run under the device-code client_id and Tidal would
+            # reject the refresh (4022).
             if is_pkce:
                 self.session.is_pkce = True
+                # Restore the pair that minted the token before anything
+                # hits Tidal, then mirror it onto the main credentials.
+                self._restore_pkce_client(data.get("api_key_index"))
                 self.session.client_enable_hires()
+            else:
+                self._restore_device_client(data.get("api_key_index"))
             # Proactive refresh: tidalapi only refreshes on 401 when the
             # response's userMessage starts with the exact string
             # "The token has expired." — Tidal has changed that message
@@ -1110,30 +1469,19 @@ class TidalClient:
             or ""
         )
         mapped = _SUB_QUALITY_MAP.get(str(hsq).upper())
-        # Cap at the client's ceiling. A device-code session with a Max
-        # subscription still can't stream hi-res — the client_id is the
-        # gate, not the subscription. Clamp to _DEVICE_CODE_MAX in that
-        # case so the UI never offers Max to a session that can't
-        # deliver it.
-        is_pkce = bool(getattr(self.session, "is_pkce", False))
-        capped = mapped
-        if mapped and not is_pkce:
-            try:
-                if (
-                    _SUB_QUALITY_ORDER.index(mapped)
-                    > _SUB_QUALITY_ORDER.index(_DEVICE_CODE_MAX)
-                ):
-                    capped = _DEVICE_CODE_MAX
-            except ValueError:
-                pass
+        # No login-flow cap: entitlement follows the OAuth client, and
+        # the Tidal HiRes device client (index 5) does serve
+        # HI_RES_LOSSLESS via `playbackinfopostpaywall` — verified live
+        # with a 24-bit/48 kHz DASH FLAC manifest. Clients that can't
+        # serve the requested tier degrade themselves: the endpoint
+        # answers 401/403 or downgrades to AAC, both handled in
+        # `request_stream_manifest()`.
         print(
             f"[tidal] get_max_quality: raw={hsq!r} mapped={mapped!r} "
-            f"is_pkce={is_pkce} capped={capped!r} "
             f"response_keys={sorted(data.keys())}",
             file=_sys.stderr,
             flush=True,
         )
-        mapped = capped
         if not mapped:
             return None
         with self._sub_lock:
@@ -1211,12 +1559,19 @@ class TidalClient:
             "access_token": self.session.access_token,
             "refresh_token": refresh_token,
             "expiry_time": expiry.isoformat() if expiry else None,
-            # Track PKCE sessions separately — their client_id/secret
-            # need to be re-swapped to the hi-res-entitled pair after
-            # load_oauth_session, otherwise subsequent stream requests
-            # silently drop back to Lossless even if the tokens are
-            # valid.
+            # Track PKCE sessions separately — their client pair has to
+            # be restored before load_oauth_session (and every refresh),
+            # otherwise Tidal rejects the token under the wrong client.
             "is_pkce": bool(getattr(self.session, "is_pkce", False)),
+            # Which client minted this token: the PKCE pair for browser
+            # sessions (None = tidalapi's mobile default), the device-code
+            # client otherwise. None for legacy files, which load_session
+            # turns back into the legacy TV client.
+            "api_key_index": (
+                self._session_pkce_client_index
+                if getattr(self.session, "is_pkce", False)
+                else self._device_code_index
+            ),
         }
         target = SESSION_FILE
         # Write to a sibling tempfile in the same dir so os.replace stays
@@ -1248,8 +1603,11 @@ class TidalClient:
         # auth check report a signed-out user as offline-signed-in.
         self._session_load_deferred = False
         config = tidalapi.Config(quality=tidalapi.Quality.high_lossless)
-        config.client_id = _DEVICE_CODE_CLIENT_ID
-        config.client_secret = _DEVICE_CODE_CLIENT_SECRET
+        # The replacement session will sign in with whichever client the
+        # login screen has selected.
+        next_key = _selected_api_key()
+        self._device_code_index = next_key.index
+        _apply_client(config, next_key)
         self.session = tidalapi.Session(config)
         _install_tidal_request_gate(self.session)
         _swap_to_impersonated_transport(self.session)
@@ -1265,6 +1623,11 @@ class TidalClient:
         # clearing it, the next login returns a stale URL for up to 10 min
         # and its code exchange fails because the verifier is gone.
         self._pkce_url_cache = None
+        self._pkce_url_client_index = None
+        self._pkce_client_index = None
+        # The replacement session has no PKCE token yet, so persistence
+        # must stop claiming one.
+        self._session_pkce_client_index = None
 
     # ------------------------------------------------------------------
     # OAuth login
@@ -1274,18 +1637,75 @@ class TidalClient:
         """Initiate device-code OAuth. Returns (url, user_code, future).
         The future resolves when the user completes browser auth.
 
-        Force the device-code client_id back into the config first.
+        Force the selected device-code client back into the config first.
         If a previous PKCE session was loaded at boot,
         `client_enable_hires` will have swapped `config.client_id` to
         the PKCE client — which Tidal rejects on the device-code
         endpoint with "Client is not a Limited Input Device client".
         """
-        self.session.config.client_id = _DEVICE_CODE_CLIENT_ID
-        self.session.config.client_secret = _DEVICE_CODE_CLIENT_SECRET
+        key = _selected_api_key()
+        self._device_code_index = key.index
+        _apply_client(self.session.config, key)
         login, future = self.session.login_oauth()
         self._login_future = future
         url = f"https://{login.verification_uri_complete}"
         return url, login.user_code, future
+
+    def select_api_key(self, index: int) -> bool:
+        """Choose the client used for the next device-code login.
+
+        TIDAL binds a token to the client that minted it, and the
+        manifest gateway also keys DRM vs. clear delivery on that
+        binding, so a live device-code session can't adopt a new client:
+        it is signed out and the caller must log in again. PKCE sessions
+        keep their own hi-res client pair and are left running.
+
+        Returns True when a re-login is required.
+        """
+        key = api_keys.get_item(index)
+        if key is None:
+            raise ValueError(f"Unknown TIDAL client index: {index}")
+        current = load_settings()
+        try:
+            current_index = int(current.tidal_api_key_index)
+        except (TypeError, ValueError):
+            current_index = -1
+        changed = current_index != key.index
+        if changed:
+            current.tidal_api_key_index = key.index
+            save_settings(current)
+        if bool(getattr(self.session, "is_pkce", False)):
+            return False
+        if not changed and self._device_code_index == key.index:
+            return False
+        self.logout()
+        return True
+
+    def select_pkce_api_key(self, index: int) -> bool:
+        """Choose the client that mints the next PKCE token.
+
+        `api_keys.PKCE_DEFAULT_INDEX` (0) keeps tidalapi's mobile pair.
+        Returns True when an active PKCE session was signed out — its
+        refresh token belongs to the client that issued it.
+        """
+        if not api_keys.is_pkce_index(index):
+            raise ValueError(f"Unknown TIDAL client index: {index}")
+        current = load_settings()
+        try:
+            current_index = int(current.tidal_pkce_client_index)
+        except (TypeError, ValueError):
+            current_index = -1
+        if current_index != index:
+            current.tidal_pkce_client_index = index
+            save_settings(current)
+        # The cached URL embeds the old client_id and its verifier is
+        # consumed by the exchange, so make the next fetch generate a
+        # fresh pair.
+        self._pkce_url_cache = None
+        if getattr(self.session, "is_pkce", False):
+            self.logout()
+            return True
+        return False
 
     def complete_login(self, future: Future, timeout: int = 300) -> bool:
         """Block until the OAuth future resolves, then save session. Returns success."""
@@ -1323,6 +1743,20 @@ class TidalClient:
         URL keeps the verifier stable across repeated fetches while
         one login attempt is in progress.
         """
+        # The URL carries the client_id, so a selection change has to
+        # invalidate the cached pair. Skip the lookup while a PKCE
+        # session is live: its refresh uses this same pair, and swapping
+        # it would get every background refresh rejected (4022).
+        if not getattr(self.session, "is_pkce", False):
+            key = _selected_pkce_key()
+            index = (
+                key.index if key is not None else api_keys.PKCE_DEFAULT_INDEX
+            )
+            if index != self._pkce_client_index:
+                self._apply_pkce_client(key)
+                self._pkce_client_index = index
+                self._pkce_url_cache = None
+            self._pkce_url_client_index = index
         cached = getattr(self, "_pkce_url_cache", None)
         if cached is not None:
             url, generated_at = cached
@@ -1349,6 +1783,25 @@ class TidalClient:
                 f"{int(state['seconds_remaining'])}s ({state['reason']})"
             )
         try:
+            # The pasted code is bound to the client that generated the
+            # URL, so exchange under that pair. Falling back to the
+            # stored selection covers a restart between the two steps
+            # (the cached URL, and its verifier, are gone by then).
+            index = self._pkce_url_client_index
+            if index is None:
+                key = _selected_pkce_key()
+                index = (
+                    key.index
+                    if key is not None
+                    else api_keys.PKCE_DEFAULT_INDEX
+                )
+            else:
+                key = api_keys.get_item(index)
+            self._apply_pkce_client(key)
+            self._pkce_client_index = index
+            self._session_pkce_client_index = (
+                key.index if key is not None else None
+            )
             token = self.session.pkce_get_auth_token(redirect_url)
             self.session.process_auth_token(token, is_pkce_token=True)
             # Defensive: make sure is_pkce actually sticks on the session
@@ -1357,9 +1810,9 @@ class TidalClient:
             # reloaded session would silently fall back to the non-hi-res
             # client_id on next restart.
             self.session.is_pkce = True
-            # Swap the active client_id/secret to the hi-res-entitled
-            # PKCE pair so subsequent API calls use the credentials that
-            # actually unlock Max quality streams.
+            # Swap the active client_id/secret to the PKCE pair the token
+            # was minted under so subsequent API calls (and refreshes)
+            # use the credentials that issued it.
             self.session.client_enable_hires()
             if self.session.check_login():
                 self.save_session()
@@ -1510,7 +1963,15 @@ class TidalClient:
         return self._favorites_sorted("playlists")
 
     def get_user_playlists(self) -> list:
-        items = _fetch_all_pages(self.session.user.playlists)
+        # A deferred session (no network, or a Tidal backoff window at
+        # boot) never populates `session.user`, so this used to raise
+        # AttributeError straight through /api/playlists/mine as a 500.
+        # Degrade the same way `_favorites_sorted` does: no user, no
+        # favourites to list.
+        user = getattr(self.session, "user", None)
+        if user is None:
+            return []
+        items = _fetch_all_pages(user.playlists)
         return _sort_by_date_added(items)
 
     def get_artist_albums(self, artist) -> list:
@@ -1602,7 +2063,12 @@ class TidalClient:
 
     def favorite(self, kind: str, obj_id: str, add: bool) -> None:
         """Add or remove a favorite. `kind` in {track, album, artist, playlist, mix}."""
-        favs = self.session.user.favorites
+        # AttributeError on `None.favorites` reads like a bug in our code;
+        # this is really "the session hasn't finished loading yet".
+        user = getattr(self.session, "user", None)
+        if user is None:
+            raise RuntimeError("Tidal session isn't ready yet — sign-in is still pending")
+        favs = user.favorites
         # tidalapi's mix helpers are plural (add_mixes / remove_mixes) and
         # accept a list of string ids, while the other kinds are singular
         # and expect an int (or a uuid string for playlist).
@@ -1647,7 +2113,10 @@ class TidalClient:
         return result
 
     def create_playlist(self, title: str, description: str = ""):
-        return self.session.user.create_playlist(title, description)
+        user = getattr(self.session, "user", None)
+        if user is None:
+            raise RuntimeError("Tidal session isn't ready yet — sign-in is still pending")
+        return user.create_playlist(title, description)
 
     def owns_playlist(self, playlist) -> bool:
         try:

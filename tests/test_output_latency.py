@@ -123,6 +123,7 @@ def test_exclusive_fallback_recomputes_the_block_for_the_mixer_rate(monkeypatch)
     # has to be sized for that rate rather than the one that failed.
     class _Decoder:
         sample_rate = 192000
+        source_channels = 2
         channels = 2
         sounddevice_dtype = "float32"
 

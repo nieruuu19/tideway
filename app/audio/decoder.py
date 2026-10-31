@@ -21,6 +21,7 @@ from __future__ import annotations
 import io
 import logging
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from typing import Iterator, Optional, Union
@@ -70,12 +71,25 @@ class Decoder:
     `source` may be a filesystem path (for local files) or any
     file-like with read/seek (for streamed DASH via `SegmentReader`).
 
-    Not thread-safe: the decoder thread is the sole caller of
-    `next_pcm()`. `request_seek()` may be called from any thread
-    — it's just a flag the decode loop reads between frames.
+    `next_pcm()` belongs to the decode thread; `request_seek()` may be
+    called from any thread — it's just a flag the decode loop reads
+    between frames. `close()` may also come from any thread (teardown,
+    preload drop, the cross-rate bridge) and is serialized against
+    `next_pcm` by `_io_lock`: freeing the PyAV container while the
+    decode thread is inside libavformat was an access violation that
+    killed the backend (crash dump from the `pcm-preload` thread in
+    avformat-63, during a fast track change that dropped a preload).
     """
 
-    def __init__(self, source: Union[str, io.IOBase]):
+    # How long close() waits for an in-flight decode to leave libav.
+    # Bounded because the decode thread can be parked in a network read;
+    # on timeout we leave the container to the thread/GC rather than
+    # block the caller. cancel_source() before close() makes that rare.
+    _CLOSE_LOCK_WAIT_S = 1.0
+
+    def __init__(self, source: Union[str, io.IOBase], *, surround: bool = False):
+        self._io_lock = threading.Lock()
+        self._closed = False
         self._source = source
         # libav's default probesize (5 MB) and analyzeduration
         # (5 seconds of audio) cause av.open to read several DASH
@@ -134,53 +148,71 @@ class Decoder:
         if channels is None:
             layout = getattr(cc, "layout", None) or getattr(cc, "channel_layout", None)
             channels = getattr(layout, "nb_channels", None) or 2
-        self._channels = int(channels)
+        self._source_channels = int(channels)
+        # Multichannel sources downmix to stereo by default: a 5.1 file
+        # played on a stereo device should still be audible. `surround`
+        # opts into passing the native layout through instead, which is
+        # what Atmos (E-AC-3) needs — its whole point is the 5.1/7.1
+        # bed. The player only sets it after confirming the output
+        # device can take the channels; otherwise it calls
+        # set_target_channels(2) and this collapses to the default.
+        self._output_channels = (
+            self._source_channels
+            if surround and self._source_channels in (6, 8)
+            else (2 if self._source_channels > 2 else self._source_channels)
+        )
+
         src_fmt = getattr(cc, "format", None)
         src_fmt_name = getattr(src_fmt, "name", None)
         out_fmt, dtype, sd_dtype, bit_depth = _FORMAT_MAP.get(
             src_fmt_name or "", ("flt", np.float32, "float32", None)
         )
         self._source_format = src_fmt_name
-        # Source-derived format/dtype, captured once at construction
-        # time so set_target_rate can flip back to bit-perfect by
-        # restoring these values.
         self._source_format_packed = out_fmt
         self._source_dtype = dtype
         self._source_sd_dtype = sd_dtype
         self._bit_depth = bit_depth
-        # Output state. Starts equal to the source side; if the
-        # player calls set_target_rate with a rate different from
-        # the source rate, these flip to float32 at the target rate.
         self._target_rate: Optional[int] = None
         self._output_format = out_fmt
         self._output_dtype = dtype
         self._sd_dtype = sd_dtype
-        self._headroom = 1.0
+        self._headroom = (
+            _RESAMPLE_HEADROOM if self._source_channels > self._output_channels else 1.0
+        )
         self._resampler = self._make_resampler()
         self._iter: Optional[Iterator[av.AudioFrame]] = None
         self._done = False
-        # request_seek() writes this; the decode loop reads it.
         self._pending_seek_s: Optional[float] = None
 
     # --- public API -------------------------------------------------
 
     @property
     def sample_rate(self) -> int:
-        """The source's native sample rate. Used by codec_info and
-        anywhere the UI wants to display "this track is 96 kHz."
-        Stays the same regardless of internal resampling."""
         return self._sample_rate
 
     @property
     def output_sample_rate(self) -> int:
-        """The rate the decoder is currently emitting at. Equals the
-        source rate unless set_target_rate has reconfigured the
-        resampler, in which case it equals the target rate."""
         return self._target_rate if self._target_rate else self._sample_rate
 
     @property
+    def source_channels(self) -> int:
+        return self._source_channels
+
+    @property
     def channels(self) -> int:
-        return self._channels
+        return self._output_channels
+
+    def set_target_channels(self, target_channels: int) -> None:
+        target_channels = max(1, int(target_channels))
+        if target_channels == self._output_channels:
+            return
+        self._output_channels = target_channels
+        needs_headroom = (
+            self._target_rate is not None
+            or self._source_channels > self._output_channels
+        )
+        self._headroom = _RESAMPLE_HEADROOM if needs_headroom else 1.0
+        self._resampler = self._make_resampler()
 
     @property
     def output_dtype(self) -> type:
@@ -192,9 +224,6 @@ class Decoder:
 
     @property
     def is_resampling_internally(self) -> bool:
-        """True when set_target_rate switched us out of bit-perfect
-        passthrough into rate-converted output. Player uses this to
-        decide whether to advertise a "bit-perfect" stream info."""
         return self._target_rate is not None
 
     def set_target_rate(self, rate: int, *, float_output: bool = False) -> None:
@@ -221,6 +250,7 @@ class Decoder:
         any samples buffered inside libav."""
         rate = int(rate)
         wants_passthrough = rate <= 0 or rate == self._sample_rate
+        downmixing = self._source_channels > self._output_channels
         if wants_passthrough:
             if float_output:
                 fmt, dtype, sd_dtype = "flt", np.float32, "float32"
@@ -234,7 +264,7 @@ class Decoder:
             self._output_format = fmt
             self._output_dtype = dtype
             self._sd_dtype = sd_dtype
-            self._headroom = 1.0
+            self._headroom = _RESAMPLE_HEADROOM if downmixing else 1.0
         else:
             if self._target_rate == rate:
                 return
@@ -249,55 +279,35 @@ class Decoder:
         return CodecInfo(
             codec=self._stream.codec_context.name,
             sample_rate=self._sample_rate,
-            channels=self._channels,
+            channels=self._source_channels,
             source_format=self._source_format,
             duration_seconds=self._duration_seconds(),
             bit_depth=self._bit_depth,
         )
 
     def request_seek(self, position_seconds: float) -> None:
-        """Mark that the next `next_pcm()` call should first seek the
-        underlying container to `position_seconds`. Thread-safe
-        because Python assignment to a simple attribute is atomic
-        under the GIL."""
+        if self._closed:
+            return
         self._pending_seek_s = float(max(0.0, position_seconds))
 
     def next_pcm(self) -> Optional[np.ndarray]:
-        """Return the next chunk of packed native-format PCM, shape
-        `(N, channels)`, dtype `self.output_dtype`. Returns None at
-        EOF."""
-        # A pending seek is handled before the done-check, not after.
-        # The block below clears `_done` precisely so a seek back from
-        # EOF can resume, but an early `if self._done: return None`
-        # above it meant that line was unreachable and the decoder
-        # stayed finished forever. Nothing in PCMPlayer reaches this
-        # today, because seek() always builds a fresh Decoder, so this
-        # is latent rather than a live bug — but the contract the
-        # comment describes is now the one the code implements.
+        if self._closed:
+            return None
+        with self._io_lock:
+            # Re-check under the lock: close() sets the flag before it
+            # waits for us, so a decode that lost the race must not
+            # touch a container that is about to be freed.
+            if self._closed:
+                return None
+            return self._next_pcm_locked()
+
+    def _next_pcm_locked(self) -> Optional[np.ndarray]:
         if self._done and self._pending_seek_s is None:
             return None
-        # Apply any pending seek BEFORE pulling the next frame. This
-        # coordinates with PCMPlayer.seek() — the player clears the
-        # pcm_queue + sets pending_seek, and the decoder applies the
-        # seek on its next iteration without needing a restart.
         if self._pending_seek_s is not None:
             target_s = self._pending_seek_s
             self._pending_seek_s = None
             try:
-                # The offset is in the STREAM's time_base, because we
-                # pass `stream=`. AV_TIME_BASE microseconds are what
-                # container.seek() wants only when seeking the
-                # container as a whole (stream=None) — passing both a
-                # stream and microseconds over-scales the target by
-                # `1_000_000 * time_base`, which for a 44.1 kHz FLAC
-                # is 22.7x. Every seek then landed past the end of the
-                # file, FFmpeg's backward seek clamped to the last
-                # frame, the decoder hit EOF within two frames, and
-                # the player advanced to the next track: issue #328,
-                # reported as "seeking ahead on Saved tracks plays the
-                # next track instead". Only local files reach here —
-                # DASH seeks by reopening at the right segment — which
-                # is why it only ever showed up on downloads.
                 self._container.seek(
                     int(target_s / float(self._stream.time_base)),
                     stream=self._stream,
@@ -305,22 +315,12 @@ class Decoder:
                 )
             except Exception:
                 log.exception("container.seek failed for target_s=%s", target_s)
-            # After a seek, PyAV's codec buffers still hold pre-seek
-            # packets that can raise a spurious StopIteration on the
-            # next decode. Flush them so the new iterator starts
-            # clean at the target position.
             try:
                 self._stream.codec_context.flush_buffers()
             except Exception:
-                # Some codecs/versions don't expose flush_buffers on
-                # the CodecContext directly — fall through; worst
-                # case the first few samples post-seek are stale.
                 pass
-            # Resampler buffers samples internally; after a seek those
-            # are pre-seek audio we need to discard. Rebuild it.
             self._resampler = self._make_resampler()
             self._iter = None
-            # A seek back from an at-EOF state must un-stick _done.
             self._done = False
 
         if self._iter is None:
@@ -340,21 +340,12 @@ class Decoder:
             return self._emit(resampled)
 
     def _emit(self, frames: list) -> np.ndarray:
-        """Pack libav frames into a numpy array, applying headroom
-        when the decoder is doing internal SRC. Headroom is a no-op
-        (and skipped entirely) in the bit-perfect passthrough case."""
-        arr = _frames_to_stereo(frames, self._output_dtype)
+        arr = _frames_to_packed(frames, self._output_channels, self._output_dtype)
         if self._headroom != 1.0:
             arr *= self._headroom
         return arr
 
     def cancel_source(self) -> None:
-        """Close just the underlying file-like source, without touching
-        the container. Safe to call from a thread other than the one
-        using the decoder — for SegmentReader this aborts any pending
-        HTTP request so the decoder loop unblocks and notices the
-        stop flag quickly. The container is left for close() to
-        clean up once the decoder thread has exited."""
         if hasattr(self._source, "close"):
             try:
                 self._source.close()  # type: ignore[union-attr]
@@ -362,28 +353,39 @@ class Decoder:
                 pass
 
     def close(self) -> None:
+        # Set the flag first (it's what next_pcm/_next_pcm_locked check)
+        # so the decode thread stops re-entering libav either way.
+        self._closed = True
+        acquired = self._io_lock.acquire(timeout=self._CLOSE_LOCK_WAIT_S)
+        if not acquired:
+            log.warning(
+                "decoder close skipped PyAV teardown: decode thread still "
+                "inside libav; leaving the container to the thread/GC"
+            )
         try:
-            self._container.close()
-        except Exception:
-            pass
-        if hasattr(self._source, "close"):
-            try:
-                self._source.close()  # type: ignore[union-attr]
-            except Exception:
-                pass
+            if acquired:
+                try:
+                    self._container.close()
+                except Exception:
+                    pass
+        finally:
+            if acquired:
+                self._io_lock.release()
+        self.cancel_source()
 
     # --- internals --------------------------------------------------
 
     def _make_resampler(self) -> av.AudioResampler:
-        # layout="stereo" packs 2 channels. Rate is whatever the
-        # current output target is — equal to the source rate by
-        # default (lossless planar→packed repack, no SRC), or the
-        # device's mixer rate after set_target_rate flips us into
-        # internal-SRC mode. Format mirrors that decision: source
-        # format when bit-perfect, "flt" (float32) when resampling.
+        layout_map = {
+            1: "mono",
+            2: "stereo",
+            6: "5.1",
+            8: "7.1",
+        }
+        layout = layout_map.get(self._output_channels, "stereo")
         return av.AudioResampler(
             format=self._output_format,
-            layout="stereo",
+            layout=layout,
             rate=self._target_rate if self._target_rate else self._sample_rate,
         )
 
@@ -394,16 +396,16 @@ class Decoder:
         return float(dur) / 1_000_000.0
 
 
-def _frames_to_stereo(frames: list, dtype: type) -> np.ndarray:
-    """Stack PyAV AudioFrames (packed stereo) into one (N, 2) array."""
+def _frames_to_packed(frames: list, channels: int, dtype: type) -> np.ndarray:
+    """Stack PyAV AudioFrames (packed) into one (N, channels) array."""
     chunks: list[np.ndarray] = []
     for f in frames:
         arr = f.to_ndarray()
         if arr.ndim == 2 and arr.shape[0] == 1:
-            arr = arr.reshape(-1, 2)
-        elif arr.ndim == 2 and arr.shape[0] == 2:
+            arr = arr.reshape(-1, channels)
+        elif arr.ndim == 2 and arr.shape[0] == channels:
             arr = arr.T
         chunks.append(arr)
     if not chunks:
-        return np.zeros((0, 2), dtype=dtype)
+        return np.zeros((0, channels), dtype=dtype)
     return np.concatenate(chunks, axis=0).astype(dtype, copy=False)

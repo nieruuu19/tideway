@@ -10,13 +10,14 @@ import {
 
 const STORAGE_KEY = "tideway:ui-prefs";
 
-/** Quality values that the browser's `<audio>` element can actually
- *  play. The backend concatenates DASH segments server-side for the
- *  lossless tiers, so all four qualities are now streamable — hi-res
- *  needs a PKCE session and enough bandwidth (~140 MB for a 4-min
- *  24/192 FLAC), but works the same way as Lossless otherwise. */
+/** Quality tiers the native player can request. The backend
+ *  concatenates DASH segments server-side for the lossless tiers, so
+ *  hi-res only needs a PKCE session and enough bandwidth (~140 MB for
+ *  a 4-min 24/192 FLAC). `atmos` resolves through Tidal's OpenAPI
+ *  E-AC-3 JOC manifest and falls back to Max on releases without an
+ *  Atmos mix — the now-playing pill always reports what's audible. */
 export type StreamingQuality =
-  "low_96k" | "low_320k" | "high_lossless" | "hi_res_lossless";
+  "low_96k" | "low_320k" | "high_lossless" | "hi_res_lossless" | "atmos";
 
 export type ThemeMode = "dark" | "light";
 

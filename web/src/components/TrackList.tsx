@@ -11,6 +11,7 @@ import {
 import type { Track } from "@/api/types";
 import type { OnDownload } from "@/api/download";
 import { prefetch } from "@/api/queryKeys";
+import { QUALITY_TONE, qualityTierFor } from "@/lib/qualityTiers";
 import { formatDuration, imageUrl } from "@/lib/utils";
 import { DownloadButton } from "@/components/DownloadButton";
 import { EmptyState } from "@/components/EmptyState";
@@ -23,6 +24,7 @@ import { useHoverPrefetch } from "@/hooks/useTrackPrefetch";
 import { useTrackSelection } from "@/hooks/useTrackSelection";
 import { useUiPreferences } from "@/hooks/useUiPreferences";
 import { HeartButton, useArrivalPulse } from "@/components/HeartButton";
+import { AtmosBadge } from "@/components/AtmosBadge";
 import { CreditsDialog } from "@/components/CreditsDialog";
 import { cn } from "@/lib/utils";
 import {
@@ -503,10 +505,19 @@ function TrackRow({
               <div
                 className={cn(
                   "flex items-center gap-2 truncate font-medium",
-                  isCurrent ? "text-primary" : "text-foreground",
+                  // The playing row is tinted by the tier that's actually
+                  // audible (gold for hi-res, sky for lossless, …) rather
+                  // than the theme's blue, so the row agrees with the
+                  // quality pill in the player bar.
+                  isCurrent
+                    ? meta.streamInfo
+                      ? QUALITY_TONE[qualityTierFor(meta.streamInfo)].text
+                      : "text-primary"
+                    : "text-foreground",
                 )}
               >
                 <span className="truncate">{track.name}</span>
+                {track.is_atmos && <AtmosBadge />}
                 {isDownloaded && (
                   <span
                     title="Downloaded — plays from disk"

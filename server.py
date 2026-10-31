@@ -63,6 +63,7 @@ from app.audio.player import PCMPlayer
 from app import playlist_import
 from app import spotify_import
 from app import tidal_realtime
+from app import api_keys
 from app.downloader import DownloadItem, DownloadStatus, Downloader
 from app.http import SESSION, network_error_classes
 from app.lastfm import _LASTFM_CONCURRENCY, LastFmClient
@@ -70,13 +71,19 @@ from app.local_index import LocalIndex
 from app import now_playing_state
 from app import search_ranking
 from app.paths import bundled_resource_dir
-from app.play_reporter import PlayReporter, PlaySession, recent_log as play_report_recent_log
+from app.play_reporter import (
+    PlayReporter,
+    PlaySession,
+    recent_log as play_report_recent_log,
+    session_id_from_token as play_report_session_id,
+)
 from app.release_keys import TRUSTED_RELEASE_PUBKEYS
 from app.release_verify import SignatureError, verify_artifact
 from app.settings import Settings, load_settings, save_settings
 from app.tidal_client import (
     TidalBackoffError,
     TidalClient,
+    request_stream_manifest,
     tidal_backoff_state,
     tidal_jitter_sleep,
 )
@@ -1206,12 +1213,9 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
     # Tidal realtime listener: pauses local playback when another
     # device on the user's Tidal account starts playing. The listener
-    # itself is currently a scaffold; the protocol-specific bits
-    # (WebSocket URL, frame parser) need a packet capture from the
-    # Tidal web client to land before this does anything. Until then
-    # start() reports phase=disabled and never opens a connection.
-    # Wiring it now so the settings toggle, status endpoint, and
-    # lifespan hook are in place when the protocol capture lands.
+    # recognises our own playback echoed back by Tidal (same session
+    # id as our access token's `sid`) and ignores it, otherwise every
+    # play through Tideway would pause itself.
     def _on_other_device_started(payload: dict) -> None:
         if not getattr(settings, "pause_on_other_device", True):
             # User opted out: keep playing through cross-device events.
@@ -1237,10 +1241,14 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         except Exception:
             return None
 
+    def _tidal_session_id_provider() -> Optional[str]:
+        return play_report_session_id(_tidal_token_provider())
+
     try:
         _rt_listener = tidal_realtime.start_listener(
             token_provider=_tidal_token_provider,
             on_other_device_started=_on_other_device_started,
+            session_id_provider=_tidal_session_id_provider,
         )
     except Exception as exc:
         print(f"[tidal-realtime] startup failed: {exc!r}", flush=True)
@@ -1607,6 +1615,22 @@ def _artists(obj) -> list[dict]:
     return out
 
 
+def _is_atmos_item(obj) -> bool:
+    """Whether Tidal flags this track/album as a Dolby Atmos mix.
+
+    `is_dolby_atmos` is set by the tidalapi patch in app/tidal_client.py
+    from either `audioModes` or `mediaMetadata.tags`. Read those lists
+    directly as a fallback for objects built before the patch ran.
+    """
+    if getattr(obj, "is_dolby_atmos", False):
+        return True
+    for attr in ("audio_modes", "media_metadata_tags"):
+        values = getattr(obj, attr, None) or []
+        if any(str(v).strip().upper() == "DOLBY_ATMOS" for v in values):
+            return True
+    return False
+
+
 def track_to_dict(t) -> dict:
     album = _first(lambda: t.album)
     # tidalapi populates `mixes` from the raw track payload — it's a
@@ -1620,9 +1644,9 @@ def track_to_dict(t) -> dict:
     )
     # media_metadata_tags — e.g. ['HIRES_LOSSLESS'] or ['LOSSLESS']. The
     # Library / search format filter + download-dropdown badge use this
-    # to tell hi-res releases from CD-res. We don't surface audio_modes
-    # (DOLBY_ATMOS / SONY_360RA) — Tidal won't serve those streams to
-    # our client_id anyway.
+    # to tell hi-res releases from CD-res. Atmos is surfaced separately
+    # as `is_atmos` so rows can badge it without the frontend having to
+    # know that the flag can arrive in either audioModes or the tags.
     media_tags = _first(lambda: t.media_metadata_tags) or []
     return {
         "kind": "track",
@@ -1640,6 +1664,9 @@ def track_to_dict(t) -> dict:
         "share_url": _first(lambda: t.share_url),
         "track_mix_id": track_mix_id,
         "media_tags": [m for m in media_tags if m] if media_tags else [],
+        # Tidal's Dolby Atmos flag for this exact catalog entry. Frontend
+        # rows badge it; the download menu offers the Atmos tier from it.
+        "is_atmos": _is_atmos_item(t),
         # International Standard Recording Code — universal track id
         # shared across Spotify / Tidal / Apple / etc. Used by the
         # Spotify-enrichment path to resolve a Tidal track to its
@@ -1670,6 +1697,27 @@ def _album_is_streamable(a) -> bool:
     return True
 
 
+def _track_is_streamable(t) -> bool:
+    """Whether Tidal will actually let this track play.
+
+    Same gate as `_album_is_streamable`, for playlist items: Tidal
+    keeps entries in a playlist that it then refuses to stream
+    (region-locked, delisted, not-yet-released) and its own client
+    hides them. `streamReady` / `allowStreaming` are the flags it
+    uses; only an explicit False hides a row, so a sparse payload
+    never blanks a listing. Accepts the raw item dict or a Track.
+    """
+    if isinstance(t, dict):
+        available = t.get("available")
+        allow = t.get("allowStreaming")
+        ready = t.get("streamReady")
+    else:
+        available = _first(lambda: t.available)
+        allow = _first(lambda: t.allow_streaming)
+        ready = _first(lambda: t.stream_ready)
+    return available is not False and allow is not False and ready is not False
+
+
 def album_to_dict(a) -> dict:
     release_date = _first(lambda: a.release_date)
     media_tags = _first(lambda: a.media_metadata_tags) or []
@@ -1689,6 +1737,10 @@ def album_to_dict(a) -> dict:
         ),
         "num_tracks": _first(lambda: a.num_tracks) or 0,
         "year": _first(lambda: a.year),
+        # Tidal's edition tag ("Deluxe Edition", "2019 Mix", …) when it
+        # isn't already part of the title. The Other-versions shelf uses
+        # it to tell two otherwise identical-looking releases apart.
+        "version": _first(lambda: a.version) or None,
         "duration": _first(lambda: a.duration) or 0,
         "cover": _image_url(a, 640),
         "artists": _artists(a),
@@ -1706,6 +1758,9 @@ def album_to_dict(a) -> dict:
         # Format tags for the library / search filter chip row +
         # download-dropdown Max/Lossless annotation.
         "media_tags": [m for m in media_tags if m] if media_tags else [],
+        # Dolby Atmos release flag — badges the album card / row and
+        # lets the download menu offer the Atmos tier.
+        "is_atmos": _is_atmos_item(a),
     }
 
 
@@ -3369,6 +3424,87 @@ def auth_status() -> dict:
         "avatar": tidal.get_user_avatar_url() if logged_in else None,
         "user_id": user_id,
     }
+
+
+class ApiClientRequest(BaseModel):
+    index: int
+
+
+@app.get("/api/auth/clients")
+def auth_clients() -> dict:
+    """OAuth clients available for the device-code login.
+
+    TIDAL binds a token to the client that issued it and chooses the
+    manifest variant (DRM-wrapped or clear) from that binding, so the
+    client is what decides whether Dolby Atmos can be decoded locally.
+
+    Available while signed out: the picker lives on the login page,
+    which by definition renders before `_require_local_access()` would
+    succeed. The payload carries no credentials.
+    """
+    try:
+        selected = int(settings.tidal_api_key_index)
+    except (TypeError, ValueError):
+        selected = api_keys.DEFAULT_API_KEY_INDEX
+    try:
+        pkce_selected = int(settings.tidal_pkce_client_index)
+    except (TypeError, ValueError):
+        pkce_selected = api_keys.PKCE_DEFAULT_INDEX
+    return {
+        "clients": api_keys.public_items(),
+        "selected": selected,
+        "pkce_clients": api_keys.pkce_public_items(),
+        "pkce_selected": pkce_selected,
+    }
+
+
+@app.post("/api/auth/client")
+def auth_select_client(req: ApiClientRequest) -> dict:
+    """Pick the client for the next device-code login.
+
+    Switching clients invalidates a device-code session (tokens are
+    client-bound), so the response says whether the UI should send the
+    user through login again. A PKCE session is unaffected and keeps
+    running — the choice applies the next time device login is used.
+    """
+    global settings
+    key = api_keys.get_item(req.index)
+    if key is None:
+        raise HTTPException(status_code=400, detail="Unknown TIDAL client index")
+    reauth = tidal.select_api_key(key.index)
+    # select_api_key writes settings.json itself; mirror the value into
+    # the live object so /api/settings agrees until the next reload.
+    settings.tidal_api_key_index = key.index
+    if reauth:
+        _invalidate_auth_cache()
+        _invalidate_preview_cache()
+        _invalidate_page_cache()
+        _invalidate_detail_cache()
+    return {"ok": True, "index": key.index, "reauth_required": reauth}
+
+
+@app.post("/api/auth/pkce-client")
+def auth_select_pkce_client(req: ApiClientRequest) -> dict:
+    """Pick the client that mints the next PKCE (browser) token.
+
+    Index 0 keeps tidalapi's mobile pair — the only one known to be
+    entitled for Max. Any other value is an api_keys entry, run through
+    the same PKCE flow; useful when a different client yields a clear
+    (non-DRM) Dolby Atmos manifest. A live PKCE session is signed out
+    because its refresh token belongs to the client that issued it.
+    Available while signed out for the same reason as the GET.
+    """
+    global settings
+    if not api_keys.is_pkce_index(req.index):
+        raise HTTPException(status_code=400, detail="Unknown TIDAL client index")
+    reauth = tidal.select_pkce_api_key(req.index)
+    settings.tidal_pkce_client_index = req.index
+    if reauth:
+        _invalidate_auth_cache()
+        _invalidate_preview_cache()
+        _invalidate_page_cache()
+        _invalidate_detail_cache()
+    return {"ok": True, "index": req.index, "reauth_required": reauth}
 
 
 @app.post("/api/auth/login/start")
@@ -5556,6 +5692,15 @@ def _native_player() -> PCMPlayer:
             # token (refresh + retry once) the same way the download
             # path does, instead of failing silently on "press play".
             force_refresh=tidal.force_refresh,
+            # Local Atmos files go through Windows' MediaPlayer (Dolby
+            # decoder MFT + spatial renderer) instead of PyAV, which
+            # drops the JOC object layer. Read live so the settings
+            # toggle applies without a restart.
+            native_atmos_enabled=lambda: settings.native_atmos_playback,
+            # Stream a Atmos track as a loopback DASH presentation while
+            # it downloads, so playback starts on the first segment (see
+            # app/audio/atmos_dash.py). Read live.
+            native_atmos_dash=lambda: settings.atmos_dash_stream,
         )
         # Mirror state changes into macOS Now Playing so media keys
         # can find us. update_state() no-ops on non-macOS / when the
@@ -5833,6 +5978,11 @@ def _snapshot_dict(snap) -> dict:
             "sample_rate_hz": si.sample_rate_hz,
             "audio_quality": si.audio_quality,
             "audio_mode": si.audio_mode,
+            # "atmos" / "dolby_audio" / None — whether the Dolby content
+            # is being placed as objects or only played as its bed. Lives
+            # with stream_info because it describes what's audible, not
+            # what was requested.
+            "immersive": snap.immersive,
         }
     return {
         "state": snap.state,
@@ -5842,6 +5992,10 @@ def _snapshot_dict(snap) -> dict:
         "volume": snap.volume,
         "muted": snap.muted,
         "error": snap.error,
+        # Without this the frontend cannot tell a rate-limit refusal
+        # from an unplayable track, and auto-advance walks the whole
+        # queue into the closed gate (each skip is another strike).
+        "error_kind": getattr(snap, "error_kind", None),
         "seq": snap.seq,
         "stream_info": stream_info,
         "force_volume": getattr(snap, "force_volume", False),
@@ -6029,10 +6183,13 @@ def player_play_track(req: _PlayerLoadRequest) -> dict:
 
 @app.post("/api/player/preload")
 def player_preload(req: _PlayerLoadRequest) -> dict:
-    """Pre-resolve the next track's manifest so auto-advance can
-    skip the network fetch. Frontend fires this ~15s before the
-    current track ends. Synchronous on the manifest fetch but
-    called well in advance, so it doesn't race track-end.
+    """Pre-stage the next queue track. PCM tracks get a decoded buffer
+    the audio callback splices in at track-end; a streamed Atmos track
+    gets its whole DASH asset downloaded to disk in the background, so
+    the click at track-end starts the native pipeline with no network
+    wait. Frontend fires this ten seconds into the current track, which
+    leaves the manifest fetch (and, for Atmos, the download) minutes of
+    head start rather than racing track-end.
     """
     _require_local_access()
     return _native_player().preload(req.track_id, quality=req.quality)
@@ -6082,9 +6239,17 @@ def player_signal_path() -> dict:
         eq_active = not eq_bypass
 
     crossfeed_amount = settings.crossfeed_amount
-    rg_active = rg_state.get("mode") != "off" and bool(
-        rg_state.get("applied_db", 0.0)
+    # `applied_db` is the offset the leveling stage asked for;
+    # `applied_effective_db` is what the active pipeline could deliver.
+    # They differ on the native Atmos path, where the offset rides on
+    # MediaPlayer's volume stage and anything above the user's headroom
+    # is capped at unity. "Active" follows the effective number — a
+    # stage that asked for +4 dB and got 0 is not doing anything.
+    rg_effective_db = float(
+        rg_state.get("applied_effective_db", rg_state.get("applied_db", 0.0))
+        or 0.0
     )
+    rg_active = rg_state.get("mode") != "off" and abs(rg_effective_db) > 0.001
     cf_active = crossfeed_amount > 0
     external_active = bool(output_state.get("external_output_active"))
 
@@ -6134,6 +6299,11 @@ def player_signal_path() -> dict:
         "replaygain": {
             "mode": rg_state.get("mode", "off"),
             "applied_db": rg_state.get("applied_db", 0.0),
+            "applied_effective_db": rg_effective_db,
+            # "tags" (Tidal's ReplayGain), "measured" (local EBU R128
+            # scan of a file with no tags), or "none"/"off".
+            "source": rg_state.get("source", "none"),
+            "loudness_lufs": rg_state.get("loudness_lufs"),
             "preamp_db": rg_state.get("preamp_db", 0.0),
             "prevent_clipping": rg_state.get("prevent_clipping", True),
             "tags_present": rg_state.get("track_gain_db") is not None
@@ -6184,13 +6354,18 @@ def player_prefetch(req: _PlayerPrefetchRequest) -> dict:
     Tidal. Called by the frontend on hover (single id) and on
     album / playlist mount (batched).
 
-    Runs the resolves in parallel with a small worker pool. Each
-    track's prefetch fires three sequential Tidal API calls (track,
-    get_stream, get_stream_manifest), so the request fan-out from
-    one album mount is workers * 3. We cap at 2 workers and let
-    `player.prefetch` jitter its first request per worker, which
-    keeps the 12-track-album burst inside Tidal's tolerance even at
-    a cold cache. Errors are swallowed per-track. Prefetch is
+    Resolves the tracks one at a time. Each track's prefetch fires up
+    to four sequential Tidal API calls (track, get_stream, and on the
+    clients that answer AAC for a lossless tier, the OpenAPI FLAC
+    manifest), and an album mount asks for ten tracks at once. Two
+    workers made that ~6 requests a second for several seconds, which
+    is the burst Tidal's anti-abuse layer reads as scraping — browsing
+    three albums and an artist page inside a minute got the account
+    suspended for 60 s with playback dead. Serially, with the jitter at
+    the top of `player.prefetch`, the same warm costs ~1-2 requests a
+    second: the first tracks are ready just as quickly as before (they
+    are warmed in order), later ones finish while the user is still
+    reading the page. Errors are swallowed per-track. Prefetch is
     fire-and-forget.
 
     No-ops when offline mode is on — the user has explicitly opted
@@ -6199,6 +6374,18 @@ def player_prefetch(req: _PlayerPrefetchRequest) -> dict:
     _require_local_access()
     if settings.offline_mode:
         return {"prefetched": 0, "total": len(req.track_ids), "skipped": "offline"}
+    # While Tidal has us suspended every resolve is refused locally
+    # anyway; running the pool just parks workers in jitter sleeps for
+    # no bytes. Album mounts arrive during exactly this window because
+    # the user is browsing while playback is blocked.
+    from app.tidal_client import tidal_backoff_state
+
+    if tidal_backoff_state()["active"]:
+        return {
+            "prefetched": 0,
+            "total": len(req.track_ids),
+            "skipped": "backoff",
+        }
     ids = [tid for tid in req.track_ids if tid]
     if not ids:
         return {"prefetched": 0, "total": 0}
@@ -6207,7 +6394,7 @@ def player_prefetch(req: _PlayerPrefetchRequest) -> dict:
     if prefetch is None:
         return {"prefetched": 0, "total": len(ids)}
     with ThreadPoolExecutor(
-        max_workers=min(2, len(ids)), thread_name_prefix="prefetch"
+        max_workers=1, thread_name_prefix="prefetch"
     ) as pool:
         results = list(
             pool.map(
@@ -7453,6 +7640,101 @@ def player_set_output_device(req: _PlayerOutputDeviceRequest) -> dict:
     return {"ok": True, "device_id": settings.audio_output_device}
 
 
+# ---------------------------------------------------------------------------
+# Dolby Atmos test panel
+#
+# A/B playback of one local file through both engines so the user can
+# hear (and see evidence of) the difference. The tester owns isolated
+# player instances — starting a test stops the queue's playback rather
+# than mixing two streams into the same endpoint.
+# ---------------------------------------------------------------------------
+
+
+class _AtmosTestPlayRequest(BaseModel):
+    path: str
+    engine: str = "windows"
+
+
+class _AtmosTestProbeRequest(BaseModel):
+    path: str
+
+
+_atmos_tester: Optional["AtmosTester"] = None
+
+
+def _atmos_tester_singleton() -> "AtmosTester":
+    global _atmos_tester
+    if _atmos_tester is None:
+        from app.audio.atmos_test import AtmosTester
+
+        _atmos_tester = AtmosTester(volume_getter=lambda: settings.volume)
+    return _atmos_tester
+
+
+@app.get("/api/player/atmos-test/capabilities")
+def atmos_test_capabilities() -> dict:
+    _require_local_access()
+    payload = _atmos_tester_singleton().capabilities()
+    downloads: list[dict] = []
+    for _track_id, path in local_index.paths():
+        # The downloader marks Atmos copies with this filename suffix,
+        # so this is a cheap filter — no need to open every file.
+        if "[dolby atmos]" in path.name.lower():
+            downloads.append({"path": str(path), "name": path.name})
+    downloads.sort(key=lambda d: d["name"].lower())
+    payload["downloads"] = downloads[:25]
+    return payload
+
+
+@app.post("/api/player/atmos-test/probe")
+def atmos_test_probe(req: _AtmosTestProbeRequest) -> dict:
+    _require_local_access()
+    from app.audio.atmos_probe import probe_media_file
+
+    try:
+        return probe_media_file(req.path)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"File not found: {req.path}")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Could not read {req.path}: {exc}"
+        )
+
+
+@app.post("/api/player/atmos-test/play")
+def atmos_test_play(req: _AtmosTestPlayRequest) -> dict:
+    _require_local_access()
+    from app.audio.native_atmos import NativeAtmosError
+
+    # Never let the tester's output mix with the queue's: this panel
+    # exists to isolate one engine at a time.
+    try:
+        _native_player().stop()
+    except Exception as exc:
+        logger.warning("atmos-test: stopping main player failed: %s", exc)
+    try:
+        return _atmos_tester_singleton().play(req.path, req.engine)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"File not found: {req.path}")
+    except (NativeAtmosError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("atmos-test play failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/player/atmos-test/status")
+def atmos_test_status() -> dict:
+    _require_local_access()
+    return _atmos_tester_singleton().status()
+
+
+@app.post("/api/player/atmos-test/stop")
+def atmos_test_stop() -> dict:
+    _require_local_access()
+    return _atmos_tester_singleton().stop()
+
+
 def _autoeq_on_device_change(device_id: str) -> None:
     """Bridge between an output-device change and the AutoEQ
     per-device resolver. Resolves the device's fingerprint from
@@ -7573,6 +7855,7 @@ def realtime_status() -> dict:
             "last_error": None,
             "reconnect_count": 0,
             "events_received": 0,
+            "self_events_ignored": 0,
             "protocol_known": False,
         }
     s = listener.status()
@@ -7581,6 +7864,7 @@ def realtime_status() -> dict:
         "last_error": s.last_error,
         "reconnect_count": s.reconnect_count,
         "events_received": s.events_received,
+        "self_events_ignored": s.self_events_ignored,
         "protocol_known": listener.is_protocol_known,
     }
 
@@ -9046,20 +9330,43 @@ def library_local() -> dict:
 # Strips the parenthetical / bracketed variant tags Tidal hangs off
 # album names so that "Hurry Up Tomorrow", "Hurry Up Tomorrow
 # (Deluxe)", "Hurry Up Tomorrow [Explicit]", and "Hurry Up Tomorrow
-# - Deluxe Edition" all reduce to the same key. Used by the More By
-# row to keep the same album from filling six slots when Tidal
-# carries it under multiple variant IDs (explicit / clean / region /
-# deluxe / standard / re-release). Conservative on purpose: we only
-# strip text inside () or [] and a trailing " - <something> Edition"
-# tail, so an album whose actual title contains a parenthetical
-# (rare but it happens — "Some Album (2024 Remaster)" is genuinely
-# distinct from "Some Album") still reduces to a different key from
-# the un-remastered version once we carry the variant tag through.
-_VARIANT_SUFFIX_RE = re.compile(
-    r"\s*[\(\[][^)\]]*[\)\]]\s*$"  # trailing parenthetical / bracketed tag
-    r"|\s*-\s*[A-Za-z0-9 ]*?(edition|version|remaster|mix)\s*$",
+# - Deluxe Edition" all reduce to the same key. Used by the Other
+# versions shelf and by the More By row to keep one release from
+# filling the shelf under multiple variant IDs (explicit / clean /
+# region / deluxe / standard / re-release).
+#
+# Only trailing tags are stripped, so a title that genuinely contains
+# a parenthetical mid-name keeps it. Trailing groups are cut one at a
+# time by scanning brackets, because Tidal nests them: Atmos masters
+# come through as "Limasawa Street ((Dolby Atmos))", which a
+# `[^)]*` regex never matches from the end.
+_VARIANT_TAIL_RE = re.compile(
+    r"\s*-\s*[^-]{0,48}?(edition|version|remaster(?:ed)?|mix|anniversary"
+    r"|deluxe|expanded|reissue|special)\s*$",
     re.IGNORECASE,
 )
+
+
+def _strip_trailing_bracket(s: str) -> str:
+    """Cut one trailing, balanced "(...)" / "[...]" group off `s`.
+
+    Nesting-aware, so "( (Dolby Atmos) )" loses the whole group in a
+    single pass. Unbalanced tails ("Album (Live") are left alone.
+    """
+    if not s or s[-1] not in ")]":
+        return s
+    close = s[-1]
+    open_ch = "(" if close == ")" else "["
+    depth = 0
+    for i in range(len(s) - 1, -1, -1):
+        ch = s[i]
+        if ch == close:
+            depth += 1
+        elif ch == open_ch:
+            depth -= 1
+            if depth == 0:
+                return s[:i].strip()
+    return s
 
 
 def _normalize_album_title(title: str) -> str:
@@ -9069,15 +9376,79 @@ def _normalize_album_title(title: str) -> str:
     if not title:
         return ""
     s = title.strip()
-    # Strip variant suffixes one at a time in case Tidal stacks them
-    # (e.g. "Album (Deluxe) [Explicit]"). Bounded loop so a malformed
-    # title can't cause infinite work.
-    for _ in range(4):
-        new = _VARIANT_SUFFIX_RE.sub("", s).strip()
-        if new == s:
+    # Bounded loop: Tidal stacks tags ("Album (Deluxe) [Explicit]") and
+    # the cap stops a malformed title from causing unbounded work.
+    for _ in range(8):
+        stripped = _strip_trailing_bracket(s)
+        if stripped == s:
+            stripped = _VARIANT_TAIL_RE.sub("", s).strip()
+        if stripped == s:
             break
-        s = new
+        s = stripped
     return " ".join(s.lower().split())
+
+
+def _versions_of(current, albums: list) -> list:
+    """Editions of `current` (same normalised title) among `albums`,
+    oldest first and without the album being viewed."""
+    current_id = str(getattr(current, "id", "") or "")
+    current_key = _normalize_album_title(getattr(current, "name", "") or "")
+    if not current_key:
+        return []
+    versions: list = []
+    seen_ids: set[str] = set()
+    for a in albums:
+        aid = str(getattr(a, "id", "") or "")
+        if not aid or aid == current_id or aid in seen_ids:
+            continue
+        seen_ids.add(aid)
+        if _normalize_album_title(getattr(a, "name", "") or "") == current_key:
+            versions.append(a)
+    # Oldest edition first — the standard release usually leads and the
+    # deluxe / remaster reissues follow, which is the order Tidal uses.
+    versions.sort(
+        key=lambda a: (
+            str(getattr(a, "release_date", "") or "9999"),
+            str(getattr(a, "name", "") or ""),
+        )
+    )
+    return versions
+
+
+def _split_album_versions(current, albums: list) -> tuple[list, list]:
+    """Split an artist's release list into other versions of `current`
+    and everything else.
+
+    Tidal carries each edition of a record (standard, deluxe, remaster,
+    2019 mix, Atmos master, region variants) as its own album ID with a
+    variant-tagged title. `_normalize_album_title` collapses those tags,
+    so a candidate whose key matches the album we're viewing is another
+    edition of the same record — that's the "Other versions" shelf
+    Tidal's own clients show. Everything else feeds "More by artist",
+    still deduped by title so a second copy of an unrelated release
+    can't fill the row.
+
+    Returns `(versions, others)`, both in catalog order, both stripped
+    of the current album and of ID duplicates.
+    """
+    versions = _versions_of(current, albums)
+    version_ids = {str(getattr(a, "id", "") or "") for a in versions}
+    current_id = str(getattr(current, "id", "") or "")
+    others: list = []
+    seen_ids: set[str] = set()
+    seen_titles: set[str] = set()
+    for a in albums:
+        aid = str(getattr(a, "id", "") or "")
+        if not aid or aid == current_id or aid in seen_ids or aid in version_ids:
+            continue
+        seen_ids.add(aid)
+        title_key = _normalize_album_title(getattr(a, "name", "") or "")
+        if title_key and title_key in seen_titles:
+            continue
+        if title_key:
+            seen_titles.add(title_key)
+        others.append(a)
+    return versions, others
 
 
 @app.get("/api/album/{album_id}")
@@ -9089,6 +9460,11 @@ def album_detail(album_id: int) -> dict:
         return cached
     try:
         album = tidal.session.album(album_id)
+    except TidalBackoffError:
+        # The album exists; we're just not allowed to ask right now. A
+        # 404 here sent the UI into "this album is gone" instead of
+        # showing the rate-limit banner.
+        raise
     except Exception as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
@@ -9109,39 +9485,37 @@ def album_detail(album_id: int) -> dict:
         except Exception:
             return default
 
-    def _more_by() -> list[dict]:
+    def _more_by() -> tuple[list[dict], list[dict]]:
         if primary is None:
-            return []
+            return [], []
         full = _safe(lambda: list(tidal.get_artist_albums(primary)) or [], [])
-        eps = _safe(lambda: list(primary.get_ep_singles(limit=20)) or [], [])
-        out: list[dict] = []
-        current_id = str(album.id)
-        # Tidal's catalog regularly carries the same release under
-        # multiple album IDs — explicit / clean variants, region-locked
-        # editions, deluxe / standard pairs, label re-issues. An ID-
-        # only dedupe lets all of those slip through and the user sees
-        # what looks like the same album twice. Dedupe by a normalized
-        # title key as well, so a title that already appeared (or that
-        # matches the album we're currently viewing) gets dropped.
-        # `_normalize_album_title` lowercases, strips parenthetical
-        # variant tags, and collapses whitespace.
-        current_title_key = _normalize_album_title(getattr(album, "name", "") or "")
-        seen_ids: set[str] = set()
-        seen_titles: set[str] = {current_title_key} if current_title_key else set()
-        for a in full + eps:
-            aid = str(getattr(a, "id", "") or "")
-            if not aid or aid == current_id or aid in seen_ids:
-                continue
-            title_key = _normalize_album_title(getattr(a, "name", "") or "")
-            if title_key and title_key in seen_titles:
-                continue
-            seen_ids.add(aid)
-            if title_key:
-                seen_titles.add(title_key)
-            out.append(album_to_dict(a))
-            if len(out) >= 12:
-                break
-        return out
+        # No limit: the artist page reads the same catalogs uncapped, and
+        # anything the cap drops here is an edition the shelf can't see.
+        eps = _safe(lambda: list(primary.get_ep_singles(limit=None)) or [], [])
+        versions, others = _split_album_versions(album, full + eps)
+        if not versions:
+            # Compilations are a big, mostly-irrelevant list for prolific
+            # artists, so they only join the candidate pool once the
+            # regular catalog came up empty for this record.
+            comps = _safe(lambda: list(primary.get_other(limit=None)) or [], [])
+            versions, others = _split_album_versions(album, full + eps + comps)
+        if not versions:
+            # Releases credited to a different lead artist (soundtracks,
+            # regional re-issues, guest-led editions) hide their siblings
+            # from the artist catalog, but Tidal's own "similar albums"
+            # for the release usually carries them. Title-identical only,
+            # so this can't pull in genuinely different records.
+            similar = _safe(lambda: list(album.similar()) or [], [])
+            versions = _versions_of(album, similar)
+            if versions:
+                found = {str(getattr(a, "id", "") or "") for a in versions}
+                others = [
+                    a for a in others if str(getattr(a, "id", "") or "") not in found
+                ]
+        return (
+            [album_to_dict(a) for a in others[:12]],
+            [album_to_dict(a) for a in versions[:12]],
+        )
 
     def _related_artists() -> list[dict]:
         if primary is None:
@@ -9173,12 +9547,14 @@ def album_detail(album_id: int) -> dict:
         f_more_by = pool.submit(_more_by)
         f_related = pool.submit(_related_artists)
 
+    more_by_artist, other_versions = f_more_by.result()
     result = {
         **album_to_dict(album),
         "tracks": f_tracks.result(),
         "similar": f_similar.result(),
         "review": f_review.result(),
-        "more_by_artist": f_more_by.result(),
+        "more_by_artist": more_by_artist,
+        "other_versions": other_versions,
         "related_artists": f_related.result(),
     }
     _store_detail_cache(cache_key, result)
@@ -9208,6 +9584,8 @@ def artist_detail(artist_id: int) -> dict:
         return cached[1]
     try:
         artist = tidal.session.artist(artist_id)
+    except TidalBackoffError:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
@@ -9516,6 +9894,8 @@ def artist_radio(artist_id: int) -> list[dict]:
     try:
         artist = tidal.session.artist(artist_id)
         tracks = artist.get_radio(limit=100)
+    except TidalBackoffError:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
     return [track_to_dict(t) for t in filter_ai_tracks(tracks)]
@@ -9544,6 +9924,8 @@ def artist_extras(artist_id: int) -> dict:
         return c[1]
     try:
         artist = tidal.session.artist(artist_id)
+    except TidalBackoffError:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
@@ -10236,6 +10618,8 @@ def track_radio(track_id: int) -> list[dict]:
     try:
         track = tidal.session.track(track_id)
         radio = track.get_track_radio()
+    except TidalBackoffError:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
     return [track_to_dict(t) for t in filter_ai_tracks(radio)]
@@ -10252,6 +10636,8 @@ def my_mixes() -> list[dict]:
     _require_auth()
     try:
         page = tidal.session.mixes()
+    except TidalBackoffError:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
     out: list[dict] = []
@@ -10291,6 +10677,7 @@ def mix_detail(mix_id: str) -> dict:
         for t in filter_ai_tracks(
             [it for it in items if type(it).__name__ == "Track"]
         )
+        if _track_is_streamable(t)
     ]
     result = {
         "kind": "mix",
@@ -10351,6 +10738,7 @@ def _fetch_playlist_items_with_added_at(
             return [
                 {**track_to_dict(t), "added_at": None}
                 for t in filter_ai_tracks(tracks)
+                if _track_is_streamable(t)
             ]
 
         items = payload.get("items") or []
@@ -10359,6 +10747,12 @@ def _fetch_playlist_items_with_added_at(
         for entry in items:
             raw = (entry or {}).get("item")
             if not raw:
+                continue
+            # Tidal keeps unplayable entries (region-locked, delisted)
+            # in the item list with streamReady/allowStreaming false;
+            # its own client hides them, and so do we — clicking one
+            # used to fail the resolve with "asset not ready".
+            if not _track_is_streamable(raw):
                 continue
             try:
                 # tidalapi's parser converts a raw track dict into a
@@ -10507,12 +10901,16 @@ def _resolve_stream_sources(
 ) -> tuple[list[str], Optional[str]]:
     """Return (urls, ext_hint) for a track.
 
-    * Device-code sessions return a single progressive URL.
-    * PKCE sessions return a manifest whose `urls` list is either one
-      progressive URL (BTS) or many per-segment URLs (DASH). DASH
-      segments are byte-concatenable — the downloader already relies on
-      this — so the caller can either redirect (1 URL) or stream the
-      concatenated bytes back (multi-segment).
+    Both session types resolve through `request_stream_manifest()` — the
+    manifest endpoint is the only one that serves lossless, and the
+    legacy `Track.get_url()` (device-code only) silently answers AAC 320
+    for every tier. `get_url()` survives as the fallback for tracks that
+    have no manifest at all (old catalogue / podcasts).
+
+    `urls` is either one progressive URL (BTS) or many per-segment URLs
+    (DASH). DASH segments are byte-concatenable — the downloader already
+    relies on this — so the caller can either redirect (1 URL) or stream
+    the concatenated bytes back (multi-segment).
     """
     key = (track_id, quality)
     now = time.monotonic()
@@ -10527,21 +10925,28 @@ def _resolve_stream_sources(
         raise HTTPException(status_code=404, detail=f"{type(exc).__name__}: {exc}")
 
     def _fetch_once() -> tuple[list[str], Optional[str]]:
-        if getattr(tidal.session, "is_pkce", False):
-            stream = track.get_stream()
-            manifest = stream.get_stream_manifest()
-            if getattr(manifest, "is_encrypted", False):
-                # Encrypted streams would need per-segment decryption
-                # keys we don't have — refuse rather than stream noise.
-                raise HTTPException(
-                    status_code=415,
-                    detail="Encrypted stream — not playable in the browser.",
-                )
-            urls = [u for u in list(manifest.urls or []) if u]
-            ext = getattr(manifest, "file_extension", None)
-            return (urls, ext)
-        url = track.get_url()
-        return ([url] if url else [], None)
+        try:
+            _stream, manifest, _delivered = request_stream_manifest(
+                tidal.session, track
+            )
+        except (
+            tidalapi.exceptions.StreamNotAvailable,
+            tidalapi.exceptions.URLNotAvailable,
+        ):
+            if getattr(tidal.session, "is_pkce", False):
+                raise
+            url = track.get_url()
+            return ([url] if url else [], None)
+        if getattr(manifest, "is_encrypted", False):
+            # Encrypted streams would need per-segment decryption
+            # keys we don't have — refuse rather than stream noise.
+            raise HTTPException(
+                status_code=415,
+                detail="Encrypted stream — not playable in the browser.",
+            )
+        urls = [u for u in list(manifest.urls or []) if u]
+        ext = getattr(manifest, "file_extension", None)
+        return (urls, ext)
 
     with downloader.quality_lock:
         original = tidal.session.config.quality
@@ -10811,9 +11216,10 @@ def _pick_stream_quality(requested: Optional[str]) -> str:
     """Resolve the effective streaming quality. All four PKCE-reachable
     tiers (low_96k / low_320k / high_lossless / hi_res_lossless) are
     streamable in-browser via the DASH segment-concat path. Anything
-    else (legacy/unknown token) falls back to high_lossless. None falls
-    back to AAC 320 which every browser can play without question and
-    is the cheapest bandwidth default."""
+    else (legacy/unknown token, or "atmos" — E-AC-3 in fMP4 isn't
+    playable by an `<audio>` element) falls back to high_lossless. None
+    falls back to AAC 320 which every browser can play without question
+    and is the cheapest bandwidth default."""
     if not requested:
         return "low_320k"
     q = requested.lower()
@@ -11225,7 +11631,10 @@ QUALITIES = [
     },
     {
         "value": "low_320k",
-        "label": "Medium",
+        # TIDAL files both AAC rungs under "Low" and splits them by
+        # bitrate; the menus keep them as separate entries, so the
+        # bitrate is what tells them apart.
+        "label": "Low",
         "codec": "AAC",
         "bitrate": "320 kbps",
         "description": "Standard streaming.",
@@ -11245,6 +11654,23 @@ QUALITIES = [
         "description": "Up to 24-bit, 192 kHz.",
     },
 ]
+
+# Dolby Atmos (E-AC-3 JOC). Not a tidalapi Quality member — the asset
+# comes from the OpenAPI trackManifests endpoint via app/atmos.py, so
+# the downloader and player handle it on their own code path. Offered
+# separately from QUALITIES because it needs a Max subscription and can
+# legitimately be missing for a given release, in which case callers
+# fall back to Max the same way playback does.
+ATMOS_QUALITY = {
+    "value": "atmos",
+    "label": "Dolby Atmos",
+    "codec": "E-AC-3",
+    "bitrate": "up to 768 kbps",
+    "description": (
+        "Dolby Atmos (E-AC-3 JOC) 5.1/7.1 core bed; falls back to Max "
+        "when TIDAL has no Atmos mix for the release."
+    ),
+}
 
 
 @app.get("/api/subscription")
@@ -11301,13 +11727,19 @@ def list_qualities() -> list[dict]:
     # fails (network, stale token), fall back to the full list rather
     # than hide options the user might actually have.
     max_quality = tidal.get_max_quality()
+    # Atmos is always offered: TIDAL's subscription tier (which only
+    # tracks the stereo FLAC ceiling) is not a reliable proxy for the
+    # Atmos entitlement — sessions reporting "High" still resolve
+    # E-AC-3 JOC manifests. When the release has no Atmos mix the
+    # downloader falls back to the tier ceiling.
+    atmos = [ATMOS_QUALITY]
     if not max_quality:
         print(
             "[api/qualities] max_quality unknown — returning full list",
             file=sys.stderr,
             flush=True,
         )
-        return QUALITIES
+        return atmos + QUALITIES
     try:
         ceiling = _QUALITY_ORDER_SERVER.index(max_quality)
     except ValueError:
@@ -11317,16 +11749,30 @@ def list_qualities() -> list[dict]:
             file=sys.stderr,
             flush=True,
         )
-        return QUALITIES
+        return atmos + QUALITIES
     allowed = set(_QUALITY_ORDER_SERVER[: ceiling + 1])
     filtered = [q for q in QUALITIES if q["value"] in allowed]
     print(
         f"[api/qualities] max={max_quality} allowed={sorted(allowed)} "
-        f"returned={[q['value'] for q in filtered]}",
+        f"returned={[q['value'] for q in atmos + filtered]}",
         file=sys.stderr,
         flush=True,
     )
-    return filtered
+    return atmos + filtered
+
+
+@app.get("/api/streaming-qualities")
+def list_streaming_qualities() -> list[dict]:
+    """Quality tiers for the Now Playing / Settings streaming picker.
+
+    Separate from `/api/qualities` so the download menus can gate on the
+    subscription ceiling without hiding the playback-only fallbacks.
+    Atmos is offered regardless of the subscription tier: the player
+    falls back to Max when the account or the release has no Atmos
+    asset, and the now-playing pill reports what actually played.
+    """
+    _require_local_access()
+    return list(QUALITIES) + [ATMOS_QUALITY]
 
 
 # ---------------------------------------------------------------------------
@@ -11346,6 +11792,8 @@ class SettingsPayload(BaseModel):
     notify_on_complete: Optional[bool] = None
     notify_on_track_change: Optional[bool] = None
     exclusive_mode: Optional[bool] = None
+    native_atmos_playback: Optional[bool] = None
+    atmos_dash_stream: Optional[bool] = None
     force_volume: Optional[bool] = None
     continue_playing_after_queue_ends: Optional[bool] = None
     pause_on_other_device: Optional[bool] = None
@@ -12180,6 +12628,11 @@ def editorial_page(name: str) -> dict:
         return cached
     try:
         page = loader()
+    except TidalBackoffError:
+        # Not a gateway failure — we refused the call ourselves. Let the
+        # TidalBackoffError handler answer with its 503 + Retry-After so
+        # the frontend's backoff banner can explain the wait.
+        raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
     result = _serialize_page(page)

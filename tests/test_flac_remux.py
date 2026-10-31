@@ -182,7 +182,7 @@ def test_fetch_stream_sources_returns_codec_for_pkce_dash_flac():
     )
     dl, track = _build_downloader(is_pkce=True, manifest=manifest)
 
-    urls, ext, codec = dl._fetch_stream_sources(track, quality=None)
+    urls, ext, codec, _delivered = dl._fetch_stream_sources(track, quality=None)
 
     assert urls == manifest.urls
     assert ext == ".m4a"  # what tidalapi reported — caller decides what to do with it
@@ -201,21 +201,26 @@ def test_fetch_stream_sources_uppercases_codec_string():
     )
     dl, track = _build_downloader(is_pkce=True, manifest=manifest)
 
-    _, _, codec = dl._fetch_stream_sources(track, quality=None)
+    _, _, codec, _delivered = dl._fetch_stream_sources(track, quality=None)
     assert codec == "FLAC"
 
 
 def test_fetch_stream_sources_returns_none_codec_for_device_code():
-    """Device-code sessions don't have a manifest — codec is None."""
+    """No manifest on the track -> legacy get_url() fallback: no
+    extension hint, codec, or delivered tier to report."""
     dl, track = _build_downloader(
         is_pkce=False, direct_url="https://cdn/song.flac?token=x"
     )
+    track.get_stream.side_effect = downloader.tidalapi.exceptions.StreamNotAvailable(
+        "no manifest"
+    )
 
-    urls, ext, codec = dl._fetch_stream_sources(track, quality=None)
+    urls, ext, codec, delivered = dl._fetch_stream_sources(track, quality=None)
 
     assert urls == ["https://cdn/song.flac?token=x"]
     assert ext is None
     assert codec is None
+    assert delivered is None
 
 
 def test_fetch_stream_sources_handles_non_string_codec_attr():
@@ -229,5 +234,5 @@ def test_fetch_stream_sources_handles_non_string_codec_attr():
     )
     dl, track = _build_downloader(is_pkce=True, manifest=manifest)
 
-    _, _, codec = dl._fetch_stream_sources(track, quality=None)
+    _, _, codec, _delivered = dl._fetch_stream_sources(track, quality=None)
     assert codec is None

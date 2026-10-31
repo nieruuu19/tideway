@@ -232,6 +232,14 @@ _FIELDS_MANAGED_ELSEWHERE: dict[str, str] = {
     # Spotify client_id — set via the Spotify importer page's
     # own setup flow.
     "spotify_client_id": "/api/spotify/client-id",
+    # OAuth client for the device-code login — set via
+    # POST /api/auth/client, which also has to sign out a live
+    # device-code session because tokens are client-bound.
+    "tidal_api_key_index": "/api/auth/client",
+    # OAuth client for the PKCE login — set via
+    # POST /api/auth/pkce-client, which also clears the cached
+    # authorization URL that embeds the old client_id.
+    "tidal_pkce_client_index": "/api/auth/pkce-client",
 }
 
 

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   AudioLines,
@@ -20,7 +20,8 @@ import {
 } from "lucide-react";
 import type { OnDownload } from "@/api/download";
 import type { StreamInfo } from "@/api/types";
-import { formatDuration, imageUrl } from "@/lib/utils";
+import { SeekBar } from "@/components/SeekBar";
+import { imageUrl } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -58,6 +59,7 @@ import {
   useUiPreferences,
   type StreamingQuality,
 } from "@/hooks/useUiPreferences";
+import { QUALITY_TONE, type QualityTier } from "@/lib/qualityTiers";
 import { cn } from "@/lib/utils";
 
 export function NowPlaying({
@@ -321,6 +323,7 @@ export function NowPlaying({
           >
             <ListMusic className="h-4 w-4" />
           </Button>
+          <DolbyBadge kind={streamInfo?.immersive} />
           <StreamingQualityPicker isLocal={isLocal} streamInfo={streamInfo} />
           <SleepTimerButton />
           <OutputDevicePicker />
@@ -357,64 +360,80 @@ function ProgressBar({
   const { currentTime, duration } = usePlayerTime();
   const actions = usePlayerActions();
   useRecordPlays(track, currentTime);
-  const pct = duration > 0 ? (currentTime / duration) * 100 : 0;
   return (
-    <div className="group flex w-full max-w-xl items-center gap-2 text-[11px] text-muted-foreground">
-      <span className="w-10 text-right tabular-nums">
-        {formatDuration(currentTime)}
-      </span>
-      <input
-        type="range"
-        min={0}
-        max={Math.max(duration, 1)}
-        step={0.1}
-        value={Math.min(currentTime, duration || 0)}
-        onChange={(e) => actions.seek(Number(e.target.value))}
-        // Thicken from h-1 to h-1.5 when the row is hovered. The
-        // `group` modifier on the wrapper means the seek bar grows
-        // any time the cursor is anywhere over the time row, which
-        // matches the "the bar invites scrubbing" UX. transition
-        // covers the height change so the bar swells / settles
-        // instead of snapping.
-        className="h-1 flex-1 cursor-pointer appearance-none rounded-full bg-secondary accent-primary transition-[height] duration-150 ease-out group-hover:h-1.5"
-        style={{
-          background: `linear-gradient(to right, hsl(var(--primary)) ${pct}%, hsl(var(--secondary)) ${pct}%)`,
-        }}
-        aria-label="Seek"
-      />
-      <span className="w-10 tabular-nums">{formatDuration(duration)}</span>
-    </div>
+    <SeekBar
+      currentTime={currentTime}
+      duration={duration}
+      onSeek={actions.seek}
+    />
   );
 }
 
-const QUALITY_OPTIONS: {
+/**
+ * Rows of the streaming-quality menu, mirroring TIDAL's own Audio
+ * quality dialog: its two lossy rungs are one "Low" row carrying a
+ * 96 / 320 kbps sub-choice, not separate "Low" and "Medium" rungs, and
+ * the lossless rungs are named by what they deliver rather than by our
+ * internal tier names. `value` is the tier a click on the row selects;
+ * rows with `subs` render the inline rate choice beneath them.
+ */
+const QUALITY_ROWS: {
   value: StreamingQuality;
   label: string;
   sublabel: string;
+  subs?: { value: StreamingQuality; label: string }[];
 }[] = [
-  { value: "low_96k", label: "Low", sublabel: "96 kbps" },
-  { value: "low_320k", label: "Medium", sublabel: "320 kbps" },
-  { value: "high_lossless", label: "High", sublabel: "Lossless (16-bit)" },
+  {
+    value: "low_320k",
+    label: "Low",
+    sublabel: "AAC · 96 or 320 kbps",
+    subs: [
+      { value: "low_96k", label: "96 kbps" },
+      { value: "low_320k", label: "320 kbps" },
+    ],
+  },
+  { value: "high_lossless", label: "High", sublabel: "16-bit, 44.1 kHz" },
   { value: "hi_res_lossless", label: "Max", sublabel: "Up to 24-bit, 192 kHz" },
+  {
+    value: "atmos",
+    label: "Dolby Atmos",
+    sublabel: "E-AC-3 JOC · 5.1/7.1 core bed",
+  },
 ];
 
-// Per-tier color for the Now Playing quality pill. Pinned Tailwind
-// palette entries read on both dark and light backgrounds without
-// needing a mode-specific override. `primary` is the brand accent,
-// reserved for Max so the top tier is visually distinct.
-const QUALITY_BADGE_CLASS: Record<StreamingQuality, string> = {
-  low_96k: "bg-neutral-500/15 text-neutral-400 hover:bg-neutral-500/25",
-  low_320k: "bg-amber-500/15 text-amber-500 hover:bg-amber-500/25",
-  high_lossless: "bg-sky-500/15 text-sky-500 hover:bg-sky-500/25",
-  hi_res_lossless: "bg-primary/15 text-primary hover:bg-primary/25",
+/** Menu label for a stored preference — both lossy rungs read "Low". */
+export function streamingQualityLabel(q: StreamingQuality): string {
+  const row = QUALITY_ROWS.find(
+    (r) => r.value === q || r.subs?.some((s) => s.value === q),
+  );
+  return row?.label ?? "Streaming";
+}
+
+// Tier palette for the quality pill, plus the colour the picker gives the
+// row you have selected: both lossy rungs are neutral (the menu groups them
+// under one "Low" row, so the pair shares one colour), lossless is blue,
+// Max is gold, and Atmos keeps violet because it is a format rather than a
+// rung on the lossy→lossless ladder. Shared with the album badges, the
+// mini-player pill and the download menus via `lib/qualityTiers` so a tier
+// never renders in two different colours.
+const QUALITY_TIER: Record<
+  StreamingQuality,
+  (typeof QUALITY_TONE)[QualityTier]
+> = {
+  low_96k: QUALITY_TONE.low,
+  low_320k: QUALITY_TONE.low,
+  high_lossless: QUALITY_TONE.high,
+  hi_res_lossless: QUALITY_TONE.max,
+  atmos: QUALITY_TONE.atmos,
 };
 
 /**
- * Map a Tidal `audio_quality` string back to one of our four
+ * Map a Tidal `audio_quality` string back to one of our
  * StreamingQuality buckets. Used to colour-code the picker pill by
  * the tier that's actually playing, even when it differs from the
  * user's preference (e.g. a Lossless-only release while the user
- * has Max selected).
+ * has Max selected). Atmos sets `audio_quality` to the mode name
+ * because there's no lossless quality string for E-AC-3.
  */
 function streamingQualityFromAudioQuality(
   aq: string | null | undefined,
@@ -424,6 +443,7 @@ function streamingQualityFromAudioQuality(
   if (v === "HIGH") return "low_320k";
   if (v === "LOSSLESS") return "high_lossless";
   if (v === "HI_RES" || v === "HI_RES_LOSSLESS") return "hi_res_lossless";
+  if (v === "DOLBY_ATMOS") return "atmos";
   return null;
 }
 
@@ -441,7 +461,7 @@ function formatKhz(hz: number | null | undefined): string | null {
 /**
  * Build the user-visible pill label from a StreamInfo. The codec
  * is dropped from the readout — the tier-coded pill color
- * (primary for hi-res, sky for lossless, amber/neutral for lossy)
+ * (gold for hi-res, sky for lossless, neutral for lossy)
  * already carries the codec-class signal, and the rate / depth
  * tells the user what they actually want to know about the stream
  * they're listening to. Pieces that aren't available (lossy
@@ -452,17 +472,92 @@ function formatKhz(hz: number | null | undefined): string | null {
  *   FLAC CD-res lossless  → "44.1kHz · 16-bit"
  *   AAC 320               → "44.1kHz"
  *   Local M4A             → "44.1kHz"
+ *   E-AC-3 JOC Atmos      → "48kHz" (the Dolby badge names the render)
  *
  * Returns null when we don't have any usable info — caller should
  * render a placeholder ("Streaming"/"Loading") rather than an empty
  * pill in that case.
  */
-function streamInfoFullLabel(info: StreamInfo | null): string | null {
+export function streamInfoFullLabel(info: StreamInfo | null): string | null {
   if (!info) return null;
   const rate = formatKhz(info.sample_rate_hz);
-  const depth = info.bit_depth ? `${info.bit_depth}-bit` : null;
-  const parts = [rate ? `${rate}kHz` : null, depth].filter(Boolean);
+  // `immersive` is the backend's render verdict, and the Dolby badge
+  // beside this pill names the renderer: "Dolby Atmos" only when the
+  // JOC objects are actually being placed, "Dolby Audio" when the mix
+  // is audible as its bed alone. Repeating "Atmos" in the readout
+  // would double up — and in the bed-only case it would be a lie — so
+  // the pill drops the head as soon as the backend has classified.
+  // Payloads older than the field (restored snapshots) fall back to
+  // the codec heuristic: TIDAL echoes `audio_mode` even when it hands
+  // back a lossy stereo fallback, so only codec / audio_quality count.
+  const classified = info.immersive != null;
+  const codec = (info.codec || "").toLowerCase();
+  const isAtmos =
+    !classified &&
+    ((info.audio_quality || "").toUpperCase() === "DOLBY_ATMOS" ||
+      codec === "eac3" ||
+      codec === "ac4");
+  const head = isAtmos ? "Atmos" : null;
+  // E-AC-3 / AC-3 / AC-4 are lossy, so the container's bit depth says
+  // nothing about the audio; "· 16-bit" next to a Dolby badge would
+  // imply a 16-bit Atmos mix that doesn't exist.
+  const dolbyLossy = codec === "eac3" || codec === "ac3" || codec === "ac4";
+  const depth =
+    !isAtmos && !dolbyLossy && info.bit_depth ? `${info.bit_depth}-bit` : null;
+  const parts = [head, rate ? `${rate}kHz` : null, depth].filter(Boolean);
   return parts.length > 0 ? parts.join(" · ") : null;
+}
+
+/**
+ * Dolby's double-D mark, drawn as two Ds back to back. Filled paths so
+ * it stays legible at badge size.
+ */
+function DolbyMark({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 48 24"
+      fill="currentColor"
+      aria-hidden="true"
+      className={className}
+    >
+      <path d="M2 2h10a10 10 0 0 1 0 20H2V2Z" />
+      <path d="M46 2H36a10 10 0 0 0 0 20h10V2Z" />
+    </svg>
+  );
+}
+
+/**
+ * "Am I actually hearing Atmos, or just the Dolby bed?" — Apple Music
+ * draws exactly this distinction, and so do we: "Dolby Atmos" only when
+ * Windows decoded the JOC objects AND a Dolby Atmos spatial format is
+ * placing them; "Dolby Audio" when the same mix is audible as its
+ * 5.1/7.1 bed (Spatial Sound off or set to Windows Sonic / DTS, or the
+ * stream went through the PCM engine, which drops the objects).
+ *
+ * The verdict is the backend's (`stream_info.immersive`) — it knows the
+ * engine, the endpoint's active spatial format, and which decoder MFT
+ * loaded. Missing means "not classified" (an older payload), so nothing
+ * renders rather than a guess.
+ */
+function DolbyBadge({ kind }: { kind: StreamInfo["immersive"] }) {
+  if (!kind) return null;
+  const atmos = kind === "atmos";
+  return (
+    <div
+      className={cn(
+        "flex items-center gap-1 rounded-full px-2 py-1 text-[10px] font-bold uppercase tracking-wider",
+        atmos ? QUALITY_TONE.atmos.badge : "bg-neutral-500/15 text-neutral-400",
+      )}
+      title={
+        atmos
+          ? "Dolby Atmos — the JOC objects are decoded and a Dolby Atmos spatial format is placing them in the sound field."
+          : "Dolby Audio — only the 5.1/7.1 bed is audible. Spatial Sound is off or set to a non-Atmos format (Windows Sonic, DTS), or this stream plays through the PCM engine, which drops the Atmos objects."
+      }
+    >
+      <DolbyMark className="h-2.5 w-5" />
+      {atmos ? "Dolby Atmos" : "Dolby Audio"}
+    </div>
+  );
 }
 
 /**
@@ -473,8 +568,8 @@ function streamInfoFullLabel(info: StreamInfo | null): string | null {
  * quality preference (this only affects future tracks, since
  * Tidal returns a fresh stream URL per quality tier per track).
  *
- * The pill colour is still tier-coded — primary for Max, sky for
- * Lossless, amber for Medium, neutral for Low — so the at-a-glance
+ * The pill colour is still tier-coded — neutral for either lossy rung,
+ * sky for lossless, gold for Max, violet for Atmos — so the at-a-glance
  * "what kind of stream is this" signal stays even when the readout
  * itself is dense codec text.
  */
@@ -498,9 +593,7 @@ function StreamingQualityPicker({
   // idle we show the user's preference label — rendering "Streaming"
   // would be a placeholder that doesn't tell anyone anything.
   const fullLabel = streamInfoFullLabel(streamInfo);
-  const fallbackLabel =
-    QUALITY_OPTIONS.find((q) => q.value === effectiveQuality)?.label ??
-    "Streaming";
+  const fallbackLabel = streamingQualityLabel(effectiveQuality);
   const pillLabel = fullLabel ?? fallbackLabel;
 
   if (isLocal) {
@@ -513,7 +606,7 @@ function StreamingQualityPicker({
       </div>
     );
   }
-  const badgeClass = QUALITY_BADGE_CLASS[effectiveQuality];
+  const badgeClass = QUALITY_TIER[effectiveQuality].pill;
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -530,40 +623,78 @@ function StreamingQualityPicker({
       <DropdownMenuContent align="end" className="w-64">
         <DropdownMenuLabel>Streaming quality</DropdownMenuLabel>
         <DropdownMenuSeparator />
-        {QUALITY_OPTIONS.map((q) => {
-          const isPreference = q.value === streamingQuality;
-          const isPlaying = q.value === effectiveQuality;
+        {QUALITY_ROWS.map((row) => {
+          const isPreference =
+            row.value === streamingQuality ||
+            !!row.subs?.some((s) => s.value === streamingQuality);
+          const isPlaying =
+            row.value === effectiveQuality ||
+            !!row.subs?.some((s) => s.value === effectiveQuality);
+          const tier = QUALITY_TIER[row.value].text;
           return (
-            <DropdownMenuItem
-              key={q.value}
-              onSelect={() => set({ streamingQuality: q.value })}
-            >
-              <div className="flex min-w-0 flex-1 flex-col">
-                <div className="flex items-center gap-2">
-                  <span
-                    className={cn(
-                      "font-semibold",
-                      isPreference && "text-primary",
+            <Fragment key={row.label}>
+              <DropdownMenuItem
+                // Re-clicking the row that is already the preference
+                // keeps the current rate instead of resetting Low to
+                // 320 kbps.
+                onSelect={() =>
+                  set({
+                    streamingQuality: isPreference
+                      ? streamingQuality
+                      : row.value,
+                  })
+                }
+              >
+                <div className="flex min-w-0 flex-1 flex-col">
+                  <div className="flex items-center gap-2">
+                    <span className={cn("font-semibold", isPreference && tier)}>
+                      {row.label}
+                    </span>
+                    {isPreference && (
+                      <span
+                        className={cn(
+                          "text-[10px] font-medium uppercase tracking-wider",
+                          tier,
+                        )}
+                      >
+                        Selected
+                      </span>
                     )}
-                  >
-                    {q.label}
+                    {isPlaying && !isPreference && (
+                      <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                        Playing
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    {row.sublabel}
+                  </div>
+                </div>
+              </DropdownMenuItem>
+              {row.subs && (
+                <div className="flex items-center gap-2 px-3 pb-2">
+                  <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                    Rate
                   </span>
-                  {isPreference && (
-                    <span className="text-[10px] font-medium uppercase tracking-wider text-primary">
-                      Selected
-                    </span>
-                  )}
-                  {isPlaying && !isPreference && (
-                    <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-                      Playing
-                    </span>
-                  )}
+                  <div className="flex gap-0.5 rounded-md bg-secondary p-0.5">
+                    {row.subs.map((sub) => (
+                      <DropdownMenuItem
+                        key={sub.value}
+                        onSelect={() => set({ streamingQuality: sub.value })}
+                        className={cn(
+                          "rounded px-2 py-0.5 text-[11px] font-medium",
+                          sub.value === streamingQuality
+                            ? "bg-background text-foreground shadow-sm"
+                            : "text-muted-foreground",
+                        )}
+                      >
+                        {sub.label}
+                      </DropdownMenuItem>
+                    ))}
+                  </div>
                 </div>
-                <div className="text-xs text-muted-foreground">
-                  {q.sublabel}
-                </div>
-              </div>
-            </DropdownMenuItem>
+              )}
+            </Fragment>
           );
         })}
         <DropdownMenuSeparator />
@@ -577,7 +708,8 @@ function StreamingQualityPicker({
         <div className="px-2 py-1.5 text-[11px] text-muted-foreground">
           The pill shows what Tidal is delivering for this track. If the release
           doesn't go up to your selected tier, you'll get the highest tier it
-          does have.
+          does have. Dolby Atmos falls back to Max on releases without an Atmos
+          mix.
         </div>
       </DropdownMenuContent>
       <SignalPathDialog

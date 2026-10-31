@@ -11,6 +11,9 @@ picks it whenever it imports, so this reverts silently the moment the
 explicit setting is dropped — and it reverts into a symptom nobody sees
 locally unless they happen to open Activity Monitor. Hence a test.
 """
+import sys
+
+import pytest
 import uvicorn
 
 
@@ -59,6 +62,7 @@ def test_loop_is_not_left_to_uvicorn_auto(monkeypatch):
     assert loop != "uvloop"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="uvloop does not support Windows")
 def test_uvloop_is_importable_so_auto_would_have_picked_it():
     """Guards the premise. If uvloop ever stops shipping, the pin above
     becomes harmless rather than load-bearing, and this test says so by

@@ -31,10 +31,15 @@ Per-platform behaviour:
     ALSA, so the duplicate-host problem doesn't apply.
 
 The function is read-only and stateless — it doesn't take any locks,
-mutate anything, or care about the player's stream lifecycle. The
-caller is responsible for the `sd._terminate()` / `sd._initialize()`
-refresh dance that picks up newly-plugged devices, since that has to
-be coordinated with the player's currently-open stream.
+mutate anything, or care about the player's stream lifecycle. Picking
+up newly-plugged devices needs a PortAudio reinit, which has to be
+coordinated with every open stream in the process; that lives in
+`pa_guard.reinit_portaudio()`.
+
+`resolve_surround_output_device` deliberately steps outside the WASAPI
+filter: the hidden MME/DirectSound duplicates of an endpoint are the
+only copies that accept a 5.1/7.1 bed when WASAPI advertises a stereo
+mix format, and that bed is what Windows' spatial APO virtualises.
 """
 from __future__ import annotations
 
@@ -43,6 +48,8 @@ import sys
 from typing import Optional
 
 import sounddevice as sd  # type: ignore
+
+from app.audio import pa_guard
 
 log = logging.getLogger(__name__)
 
@@ -140,17 +147,11 @@ def list_output_devices(stream_active: bool) -> list[dict]:
 
     if not stream_active:
         # Re-init PortAudio to pick up devices plugged in since the
-        # last query. Wrapped in try/except because some PortAudio
-        # builds raise on _terminate when nothing's been initialized
-        # yet — non-fatal, the next query_devices still works.
-        try:
-            sd._terminate()
-        except Exception:
-            pass
-        try:
-            sd._initialize()
-        except Exception:
-            log.exception("sd._initialize after refresh failed")
+        # last query. pa_guard skips it when a stream is open anywhere
+        # in the process (the caller can't see the Atmos tester's own
+        # player); terminating PortAudio under a live handle crashes
+        # the next call on it.
+        pa_guard.reinit_portaudio()
 
     try:
         devices = sd.query_devices()
@@ -293,3 +294,155 @@ def resolve_output_device(name: str) -> tuple[Optional[int], bool]:
     if not matches:
         return None, False
     return matches[0], True
+
+
+# Host APIs to try, in order, when the WASAPI copy of a device can't
+# carry a multichannel bed. MME first because that is the WinMM path
+# VLC's waveout output uses — it hands the OS a WAVE_FORMAT_EXTENSIBLE
+# buffer with the real speaker mask, which is what lets a spatial APO
+# virtualise a 5.1/7.1 bed on an endpoint whose WASAPI mix format is
+# stereo. DirectSound carries the same layout with less buffering.
+_SURROUND_FALLBACK_HOSTAPIS = ("mme", "windows directsound")
+
+_MAX_CHANNELS_FOR_PAD = 8
+
+
+def _hostapi_name(index: Optional[int]) -> str:
+    try:
+        name = sd.query_hostapis(index)["name"]
+    except Exception:
+        return ""
+    return str(name or "").lower()
+
+
+def _can_open(
+    device_index: int, channels: int, samplerate: int, dtype: str
+) -> bool:
+    """Whether PortAudio will accept this format on this device. Cheap
+    enough for a handful of candidates at stream-open time."""
+    try:
+        sd.check_output_settings(
+            device=device_index,
+            channels=channels,
+            samplerate=samplerate,
+            dtype=dtype,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def resolve_surround_output_device(
+    name: str,
+    channels: int,
+    samplerate: int,
+    dtype: str,
+) -> tuple[Optional[int], Optional[str]]:
+    """Find a PortAudio index for `name` that can carry a surround bed.
+
+    Windows exposes the same physical endpoint through several host
+    APIs, and they disagree about channel counts: the WASAPI copy
+    reports the OS mixer format (often stereo, even with Spatial Sound
+    on — the spatial APO's bed is internal), while the MME/DirectSound
+    copies report and accept the full 5.1/7.1 layout. A stereo WASAPI
+    stream leaves that APO nothing to virtualise, so when the selected
+    endpoint refuses the bed we route the same logical device through
+    the first host API that accepts it.
+
+    Returns `(index, host_api_name)`, or `(None, None)` when no copy of
+    the device can take `channels` — the caller then keeps its existing
+    downmix behaviour.
+    """
+    target = max(3, min(int(channels), _MAX_CHANNELS_FOR_PAD))
+    try:
+        devices = sd.query_devices()
+    except Exception:
+        log.exception("query_devices failed resolving surround device %r", name)
+        return None, None
+
+    wanted_name = name
+    if not wanted_name:
+        try:
+            wanted_name = sd.query_devices(kind="output").get("name") or ""
+        except Exception:
+            return None, None
+    if not wanted_name:
+        return None, None
+
+    candidates = [
+        i
+        for i, d in enumerate(devices)
+        if d.get("name") == wanted_name and _output_capable(d)
+    ]
+    if not candidates:
+        return None, None
+
+    def rank(index: int) -> int:
+        hostapi = _hostapi_name(devices[index].get("hostapi"))
+        for pos, wanted in enumerate(_SURROUND_FALLBACK_HOSTAPIS):
+            if wanted in hostapi:
+                return pos
+        return len(_SURROUND_FALLBACK_HOSTAPIS)
+
+    for index in sorted(candidates, key=rank):
+        if _can_open(index, target, samplerate, dtype):
+            return index, _hostapi_name(devices[index].get("hostapi")) or None
+    return None, None
+
+
+def resolve_fallback_output_device(
+    name: str,
+    channels: int,
+    samplerate: int,
+    dtype: str,
+    exclude: Optional[int] = None,
+) -> tuple[Optional[int], Optional[str]]:
+    """Find a working host-API copy of `name` other than `exclude`.
+
+    Windows enumerates every physical endpoint once per host API, and
+    those copies fail independently: a Spatial Sound change ("Dolby
+    Atmos for Headphones" is the common one) renegotiates the WASAPI
+    endpoint, after which that copy can refuse `IAudioClient::Start`
+    with `Unanticipated host error [PaErrorCode -9999]` while the MME
+    copy of the same speakers keeps working. Routing to another copy
+    turns a device reconfigure into a brief reconnect instead of an
+    unplayable endpoint.
+
+    Returns `(index, host_api_name)`, or `(None, None)` when no copy
+    can open the format.
+    """
+    target = max(1, min(int(channels), _MAX_CHANNELS_FOR_PAD))
+    try:
+        devices = sd.query_devices()
+    except Exception:
+        log.exception("query_devices failed resolving fallback device %r", name)
+        return None, None
+
+    wanted_name = name
+    if not wanted_name:
+        try:
+            wanted_name = sd.query_devices(kind="output").get("name") or ""
+        except Exception:
+            return None, None
+    if not wanted_name:
+        return None, None
+
+    candidates = [
+        i
+        for i, d in enumerate(devices)
+        if d.get("name") == wanted_name
+        and _output_capable(d)
+        and i != exclude
+    ]
+
+    def rank(index: int) -> int:
+        hostapi = _hostapi_name(devices[index].get("hostapi"))
+        for pos, wanted in enumerate(_SURROUND_FALLBACK_HOSTAPIS):
+            if wanted in hostapi:
+                return pos
+        return len(_SURROUND_FALLBACK_HOSTAPIS)
+
+    for index in sorted(candidates, key=rank):
+        if _can_open(index, target, samplerate, dtype):
+            return index, _hostapi_name(devices[index].get("hostapi")) or None
+    return None, None

@@ -30,7 +30,7 @@ def player(monkeypatch):
 
     decoders: list[MagicMock] = []
 
-    def make_decoder(source):
+    def make_decoder(source, surround=False):
         d = MagicMock()
         d.output_sample_rate = 44100
         d.channels = 2
@@ -40,7 +40,11 @@ def player(monkeypatch):
         decoders.append(d)
         return d
 
-    monkeypatch.setattr(player_mod, "_build_source", lambda spec, prefetched=None: object())
+    monkeypatch.setattr(
+        player_mod,
+        "_build_source",
+        lambda spec, prefetched=None, sink=None: object(),
+    )
     monkeypatch.setattr(player_mod, "Decoder", make_decoder)
     p.decoders = decoders  # type: ignore[attr-defined]
     return p

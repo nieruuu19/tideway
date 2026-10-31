@@ -31,6 +31,10 @@ export interface Track {
   /** Quality / codec tags: "HIRES_LOSSLESS" or "LOSSLESS". Frontend
    *  format-filter chip + download-dropdown annotation read these. */
   media_tags?: string[];
+  /** Tidal flags this catalog entry as a Dolby Atmos mix (audioModes /
+   *  mediaMetadata carry DOLBY_ATMOS). Drives the Atmos row badge and
+   *  the "Dolby Atmos" download tier. Absent on older payloads. */
+  is_atmos?: boolean;
   /** International Standard Recording Code. Lets us look up the
    *  same recording on Spotify (for global play counts / artist
    *  monthly listeners). Null/missing for obscure catalog entries
@@ -52,6 +56,9 @@ export interface Album {
   name: string;
   num_tracks: number;
   year: number | null;
+  /** Tidal's edition tag ("Deluxe Edition", "2019 Mix", …) when it isn't
+   *  already part of `name`. */
+  version?: string | null;
   duration: number;
   cover: string | null;
   artists: ArtistRef[];
@@ -67,6 +74,8 @@ export interface Album {
   release_date?: string | null;
   copyright?: string | null;
   media_tags?: string[];
+  /** Dolby Atmos release (see Track.is_atmos). */
+  is_atmos?: boolean;
 }
 
 export interface Artist {
@@ -154,9 +163,27 @@ export interface StreamInfo {
   /** Tidal's tier string ("HIGH" / "LOSSLESS" / "HI_RES" /
    *  "HI_RES_LOSSLESS"). Only set for streaming sources. */
   audio_quality: string | null;
-  /** "STEREO" for anything we can reach via PKCE; immersive modes
-   *  (Atmos / 360) aren't authorized on our client_id. */
+  /** "STEREO" for the normal PCM/FLAC path, "DOLBY_ATMOS" for an
+   *  E-AC-3 JOC stream. TIDAL's playbackinfo echoes the mode even
+   *  when it falls back to a lossy stereo stream, so this alone
+   *  doesn't prove the delivered asset is Atmos — check `codec` or
+   *  `audio_quality === "DOLBY_ATMOS"`. */
   audio_mode: string | null;
+  /** How Dolby content is reaching the listener, straight from the
+   *  backend's own classification.
+   *
+   *  "atmos" — the native Windows pipeline decoded the JOC objects and
+   *  a Dolby Atmos spatial format on the endpoint placed them.
+   *  "dolby_audio" — the same mix is audible only as its 5.1/7.1 bed:
+   *  Spatial Sound is off or set to something other than Atmos (Windows
+   *  Sonic, DTS), or the stream went through the PCM engine, which
+   *  drops the object metadata.
+   *  null — not Dolby content at all.
+   *
+   *  Optional because a restored now-playing snapshot can predate the
+   *  field; absent behaves like null.
+   */
+  immersive?: "atmos" | "dolby_audio" | null;
 }
 
 export interface PlayerSnapshot {
@@ -167,6 +194,11 @@ export interface PlayerSnapshot {
   volume: number;
   muted: boolean;
   error: string | null;
+  /** Why playback stopped, when the UI has to act differently.
+   *  "backoff" = Tidal's request gate is closed, so the failure isn't
+   *  about this track and the queue must not skip ahead through it.
+   *  Null/absent for ordinary per-track failures, which are skippable. */
+  error_kind?: "backoff" | null;
   seq: number;
   /** What's actually audible. Null when the player is idle or still
    *  loading; the UI hides the badge in that case. */
@@ -202,6 +234,11 @@ export interface AlbumDetail extends Album {
   similar: Album[];
   review: string | null;
   more_by_artist: Album[];
+  /** Other editions of this same record — deluxe / remastered /
+   *  anniversary mixes, region variants — grouped server-side by
+   *  normalised title. Format badges (Atmos / Max / Lossless) hang off
+   *  each entry so an Atmos mix is findable from the stereo edition. */
+  other_versions: Album[];
   related_artists: Artist[];
 }
 
@@ -388,6 +425,21 @@ export interface Settings {
    *  + fail_if_conversion_required on macOS; WASAPI exclusive on
    *  Windows. No effect on Linux. */
   exclusive_mode: boolean;
+  /** Play downloaded Dolby Atmos files through Windows' Media
+   *  Foundation pipeline (Dolby's decoder MFT + the endpoint's
+   *  spatial renderer) instead of PyAV. PyAV only renders the
+   *  E-AC-3 core bed and drops the JOC object layer, so heights and
+   *  overhead positions never reach "Dolby Atmos for Headphones".
+   *  Windows-only; applies to local files whose container profile
+   *  names Atmos. EQ / crossfeed / gapless don't run on this path;
+   *  loudness leveling does, as a gain on the helper's volume stage
+   *  (measured locally when the file carries no ReplayGain tags). */
+  native_atmos_playback: boolean;
+  /** Serve a still-downloading Atmos track to Windows' media pipeline
+   *  as a loopback DASH presentation. MediaPlayer's adaptive source
+   *  streams it segment by segment, so playback starts on the first
+   *  4 s fragment instead of after the whole 20-30 MB asset. */
+  atmos_dash_stream: boolean;
   /** Pin software volume at 100 %; let the user attenuate via their
    *  DAC, speakers, or OS volume instead. Avoids software scaling
    *  that would otherwise throw away bit-depth under Exclusive Mode. */
@@ -518,7 +570,18 @@ export interface SignalPath {
   };
   replaygain: {
     mode: "off" | "track" | "album";
+    /** Offset the leveling stage resolved, in dB. */
     applied_db: number;
+    /** Offset the active pipeline could actually deliver. Differs from
+     *  `applied_db` on the native Atmos path, where the gain rides on
+     *  MediaPlayer's volume stage and a boost past unity is capped. */
+    applied_effective_db: number;
+    /** Where the offset came from: Tidal's ReplayGain tags, a local
+     *  EBU R128 measurement of a file with no tags, or nothing. */
+    source: "tags" | "measured" | "pending" | "none" | "off";
+    /** Measured integrated loudness of the loaded file, when the
+     *  native path had to scan it. */
+    loudness_lufs: number | null;
     preamp_db: number;
     prevent_clipping: boolean;
     tags_present: boolean;
@@ -551,11 +614,107 @@ export interface SignalPath {
   };
 }
 
+/** One selectable engine in the Atmos test panel. */
+export interface AtmosTestEngine {
+  id: "windows" | "tideway";
+  label: string;
+  available: boolean;
+  reason: string | null;
+  hint: string;
+}
+
+export interface AtmosTestDownload {
+  path: string;
+  name: string;
+}
+
+export interface AtmosTestCapabilities {
+  engines: AtmosTestEngine[];
+  /** Already-downloaded Atmos tracks (filename carries the
+   *  `[Dolby Atmos]` suffix), newest-first list capped by the api. */
+  downloads: AtmosTestDownload[];
+}
+
+export interface AtmosProbeAudio {
+  codec: string;
+  /** libav's codec profile, e.g. "Dolby Digital Plus + Dolby Atmos". */
+  profile: string;
+  channels: number;
+  layout: string | null;
+  sample_rate_hz: number | null;
+  bit_rate: number | null;
+  stream_index: number;
+  audio_streams: number;
+  duration_s: number | null;
+  /** True when the container names an Atmos profile (or, failing
+   *  that, E-AC-3/AC-4 with a surround layout). */
+  is_atmos: boolean;
+  /** "container" = profile string said so; "heuristic" = codec +
+   *  channel count only; "none" = no evidence. */
+  atmos_confidence: "container" | "heuristic" | "none";
+}
+
+export interface AtmosProbe {
+  path: string;
+  exists: boolean;
+  size_bytes: number | null;
+  container: string | null;
+  duration_s: number | null;
+  audio: AtmosProbeAudio;
+  notes: string[];
+}
+
+export interface AtmosTestOutputDiag {
+  device: number | null;
+  device_name: string | null;
+  hostapi: string | null;
+  sample_rate_hz: number | null;
+  channels: number | null;
+  source_channels: number | null;
+  device_max_channels: number | null;
+  dtype: string | null;
+  exclusive: boolean;
+}
+
+export interface AtmosTestStatus {
+  engine: "windows" | "tideway" | null;
+  path: string | null;
+  error: string | null;
+  state: string;
+  position_ms: number;
+  duration_ms: number;
+  detail: {
+    /** Windows engine: decoder DLLs loaded by MediaPlayer. Dolby's
+     *  DD+ MFT appearing here is the proof the OS pipeline decoded
+     *  the file (instead of falling back to a downmix). */
+    decoders?: string[];
+    device?: string;
+    helper_running?: boolean;
+    /** Tideway engine: what the PortAudio stream actually opened. */
+    output?: AtmosTestOutputDiag | null;
+    stream?: {
+      codec: string | null;
+      audio_mode: string | null;
+      sample_rate_hz: number | null;
+    } | null;
+  };
+}
+
 export interface AuthStatus {
   logged_in: boolean;
   username: string | null;
   avatar: string | null;
   user_id: string | null;
+}
+
+/** OAuth client the device-code login can run under. TIDAL binds a
+ *  token to its issuing client and picks the playback manifest variant
+ *  from it — the mobile (PKCE) client gets a Widevine-wrapped Atmos
+ *  stream, other clients may get a clear one. */
+export interface TidalLoginClient {
+  index: number;
+  platform: string;
+  formats: string;
 }
 
 /** Tidal subscription tiers Tideway maps `get_max_quality()` to. The

@@ -5,6 +5,7 @@ import type { Album, Artist, Playlist, FavoriteKind } from "@/api/types";
 import type { OnDownload } from "@/api/download";
 import { useFavorites } from "@/hooks/useFavorites";
 import { useHeartPop } from "@/components/HeartButton";
+import { AtmosBadge } from "@/components/AtmosBadge";
 import { cn, imageUrl } from "@/lib/utils";
 import { PlayMediaButton } from "@/components/PlayMediaButton";
 import { prefetch } from "@/api/queryKeys";
@@ -97,7 +98,10 @@ export function MediaCard({
         )}
       </div>
       <div className="min-w-0">
-        <div className="truncate font-semibold">{item.name}</div>
+        <div className="flex min-w-0 items-center gap-2">
+          <div className="truncate font-semibold">{item.name}</div>
+          {item.kind === "album" && item.is_atmos && <AtmosBadge />}
+        </div>
         <div className="mt-0.5 line-clamp-2 text-xs text-muted-foreground">
           <Subtitle item={item} onNavigate={navigate} />
         </div>

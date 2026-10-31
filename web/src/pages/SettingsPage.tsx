@@ -36,10 +36,15 @@ import {
   Settings as SettingsIcon,
   Sun,
   Trash2,
+  Waves,
   X,
 } from "lucide-react";
 import { api } from "@/api/client";
 import type {
+  AtmosProbe,
+  AtmosTestDownload,
+  AtmosTestEngine,
+  AtmosTestStatus,
   EqManualProfile,
   ManualEqConfig,
   ParametricBand,
@@ -79,7 +84,7 @@ import {
   type ThemeMode,
 } from "@/hooks/useUiPreferences";
 import { Skeleton } from "@/components/Skeletons";
-import { cn } from "@/lib/utils";
+import { cn, formatDuration } from "@/lib/utils";
 import { computeEqCurve, logFrequencyGrid } from "@/lib/eqCurve";
 
 type SaveStatus = "idle" | "saving" | "saved" | "error";
@@ -128,7 +133,7 @@ export function SettingsPage({ onLogout }: { onLogout: () => void }) {
       try {
         const [s, qs] = await Promise.all([
           api.settings.get(),
-          api.qualities(),
+          api.streamingQualities(),
         ]);
         if (cancelled) return;
         setSettings(s);
@@ -348,6 +353,26 @@ export function SettingsPage({ onLogout }: { onLogout: () => void }) {
                 label="Pause when another device starts playing"
                 hint="When you start playback on another device on the same Tidal account (phone, web, another computer), Tideway pauses local playback. Matches Spotify and the official Tidal client. The listener that drives this is wired up but the realtime protocol capture is still pending, so the toggle has no effect today; flipping it off ahead of time means it'll already be off when the listener goes live."
               />
+            </Section>
+
+            <Section
+              title="Dolby Atmos"
+              icon={Waves}
+              description="Downloaded Atmos tracks (E-AC-3 JOC) can play through Windows' own media pipeline, which renders the height/object layer that PyAV drops. Use the tester below to confirm your setup with a specific file."
+            >
+              <Toggle
+                checked={settings.native_atmos_playback}
+                onChange={(v) => patch({ native_atmos_playback: v })}
+                label="Decode downloaded Atmos tracks natively (Windows)"
+                hint="Routes local files whose container profile names Dolby Atmos through Windows Media Foundation + Dolby's decoder MFT + the spatial renderer — the same pipeline Windows Media Player uses. EQ, crossfeed and gapless don't run on this path, and playback goes to Windows' default output device. Loudness leveling does: the same ReplayGain setting applies, measured locally for files that carry no tags. Falls back to the normal engine if the native pipeline can't start. Applies from the next track."
+              />
+              <Toggle
+                checked={settings.atmos_dash_stream}
+                onChange={(v) => patch({ atmos_dash_stream: v })}
+                label="Start streamed Atmos tracks before they finish downloading"
+                hint="Serves the track to Windows' media pipeline as a DASH stream over loopback, so playback starts on the first 4-second segment instead of after the whole 20-30 MB download. Falls back to buffering the file when the stream can't start. Windows only."
+              />
+              <AtmosTesterPanel />
             </Section>
           </TabsContent>
 
@@ -933,6 +958,387 @@ function AudioEngineFields() {
 }
 
 /**
+ * A/B playback tester for a local Atmos file.
+ *
+ * Two engines play the same file in isolation — Windows' Media
+ * Foundation pipeline (Dolby's decoder MFT + spatial renderer) and
+ * Tideway's normal PyAV engine. The Windows readout names the decoder
+ * DLLs MediaPlayer actually loaded, which is the difference between
+ * "decoded as Atmos" and "decoded as a 5.1 downmix"; the Tideway
+ * readout shows which host API / channel count the PCM stream
+ * negotiated. Starting a test stops the queue's playback so only one
+ * engine is audible.
+ */
+function AtmosTesterPanel() {
+  const toast = useToast();
+  const [caps, setCaps] = useState<{
+    engines: AtmosTestEngine[];
+    downloads: AtmosTestDownload[];
+  } | null>(null);
+  const [capsError, setCapsError] = useState<string | null>(null);
+  const [path, setPath] = useState("");
+  const [probe, setProbe] = useState<AtmosProbe | null>(null);
+  const [probing, setProbing] = useState(false);
+  const [engine, setEngine] = useState<"windows" | "tideway">("windows");
+  const [status, setStatus] = useState<AtmosTestStatus | null>(null);
+  const [starting, setStarting] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.player.atmosTest
+      .capabilities()
+      .then((c) => {
+        if (cancelled) return;
+        setCaps(c);
+        const first = c.engines.find((e) => e.id === "windows" && e.available);
+        if (!first) setEngine("tideway");
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setCapsError(err instanceof Error ? err.message : String(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Poll while a test is running so the clock and diagnostics stay
+  // live. Stops on its own once the file ends.
+  useEffect(() => {
+    if (!status || status.engine === null) return;
+    const finished =
+      status.duration_ms > 0 &&
+      status.position_ms >= status.duration_ms - 500 &&
+      status.state !== "playing";
+    if (finished || status.state === "ended" || status.state === "error")
+      return;
+    const id = window.setInterval(() => {
+      api.player.atmosTest
+        .status()
+        .then(setStatus)
+        .catch(() => {
+          /* status is best-effort; a transient failure just skips a tick */
+        });
+    }, 500);
+    return () => window.clearInterval(id);
+  }, [status]);
+
+  // Stop a running test when the page unmounts so it can't keep
+  // playing after the user navigates away.
+  useEffect(() => {
+    return () => {
+      api.player.atmosTest.stop().catch(() => {
+        /* nothing to clean up if the backend is gone */
+      });
+    };
+  }, []);
+
+  const runProbe = async (target?: string) => {
+    const value = (target ?? path).trim();
+    if (!value) return;
+    setProbing(true);
+    try {
+      const p = await api.player.atmosTest.probe(value);
+      setProbe(p);
+      if (target) setPath(value);
+    } catch (err) {
+      setProbe(null);
+      toast.show({
+        kind: "error",
+        title: "Couldn't read that file",
+        description: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setProbing(false);
+    }
+  };
+
+  const start = async () => {
+    const value = path.trim();
+    if (!value) return;
+    setStarting(true);
+    try {
+      const s = await api.player.atmosTest.play(value, engine);
+      setStatus(s);
+    } catch (err) {
+      toast.show({
+        kind: "error",
+        title: "Couldn't start the test",
+        description: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  const stop = async () => {
+    try {
+      setStatus(await api.player.atmosTest.stop());
+    } catch {
+      setStatus(null);
+    }
+  };
+
+  const dolbyLoaded = (status?.detail.decoders ?? []).some((d) =>
+    /dolby/i.test(d),
+  );
+  const running = status?.engine !== null && status !== null;
+  const pct =
+    status && status.duration_ms > 0
+      ? Math.min(100, (status.position_ms / status.duration_ms) * 100)
+      : 0;
+
+  return (
+    <div className="flex flex-col gap-4">
+      <p className="text-xs text-muted-foreground">
+        Plays a file through both engines so you can hear the difference. The
+        Windows engine is the one Windows Media Player uses; it renders the
+        Atmos objects through the endpoint's spatial renderer. This panel uses
+        Windows&apos; default output device — set{" "}
+        <em>Spatial sound → Dolby Atmos for Headphones</em> in Windows Sound
+        settings first. Starting a test pauses the main player.
+      </p>
+
+      {capsError && (
+        <p className="text-xs text-destructive">
+          Test panel unavailable: {capsError}
+        </p>
+      )}
+
+      <Field label="Media file">
+        <div className="flex flex-col gap-2">
+          <div className="flex gap-2">
+            <Input
+              value={path}
+              onChange={(e) => setPath(e.target.value)}
+              placeholder="C:\Music\Artist - Album\track [Dolby Atmos].m4a"
+              spellCheck={false}
+              className="font-mono text-xs"
+            />
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={() => void runProbe()}
+              disabled={probing || !path.trim()}
+            >
+              {probing ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                "Inspect"
+              )}
+            </Button>
+          </div>
+
+          {caps && caps.downloads.length > 0 && (
+            <select
+              value=""
+              onChange={(e) => e.target.value && void runProbe(e.target.value)}
+              className="h-9 rounded-md border border-input bg-secondary px-3 text-xs"
+            >
+              <option value="">Pick a downloaded Atmos track…</option>
+              {caps.downloads.map((d) => (
+                <option key={d.path} value={d.path}>
+                  {d.name}
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+      </Field>
+
+      {probe && (
+        <div className="rounded-md border border-border/60 bg-secondary/40 p-3 text-xs">
+          <div className="mb-2 flex flex-wrap items-center gap-x-4 gap-y-1">
+            <span
+              className={cn(
+                "rounded px-1.5 py-0.5 font-semibold",
+                probe.audio.is_atmos
+                  ? "bg-emerald-500/15 text-emerald-400"
+                  : "bg-amber-500/15 text-amber-400",
+              )}
+            >
+              {probe.audio.is_atmos ? "Dolby Atmos" : "Not Atmos"}
+              {probe.audio.atmos_confidence === "heuristic" && " (likely)"}
+            </span>
+            <span className="font-mono">{probe.audio.codec.toUpperCase()}</span>
+            <span>
+              {probe.audio.channels} ch
+              {probe.audio.layout ? ` (${probe.audio.layout})` : ""}
+            </span>
+            {probe.audio.sample_rate_hz && (
+              <span>{probe.audio.sample_rate_hz / 1000} kHz</span>
+            )}
+            {probe.audio.bit_rate && (
+              <span>{Math.round(probe.audio.bit_rate / 1000)} kbps</span>
+            )}
+            {probe.duration_s && (
+              <span>{formatDuration(probe.duration_s)}</span>
+            )}
+            {probe.size_bytes && (
+              <span>{(probe.size_bytes / 1024 / 1024).toFixed(1)} MB</span>
+            )}
+          </div>
+          <p className="mb-2 font-mono text-[11px] text-muted-foreground">
+            {probe.audio.profile || "(no profile in container)"}
+          </p>
+          <ul className="list-disc space-y-1 pl-4 text-muted-foreground">
+            {probe.notes.map((n) => (
+              <li key={n}>{n}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      <Field label="Engine">
+        <div className="flex flex-wrap gap-2">
+          {(caps?.engines ?? []).map((e) => (
+            <button
+              key={e.id}
+              type="button"
+              onClick={() => setEngine(e.id)}
+              disabled={!e.available}
+              className={cn(
+                "rounded-md border px-3 py-1.5 text-xs font-medium transition-colors disabled:opacity-40",
+                engine === e.id
+                  ? "border-primary bg-primary/10 text-foreground"
+                  : "border-border text-muted-foreground hover:text-foreground",
+              )}
+              title={e.reason ?? e.hint}
+            >
+              {e.label}
+            </button>
+          ))}
+        </div>
+        <p className="mt-1 text-xs text-muted-foreground">
+          {(caps?.engines ?? []).find((e) => e.id === engine)?.reason ??
+            (caps?.engines ?? []).find((e) => e.id === engine)?.hint ??
+            ""}
+        </p>
+      </Field>
+
+      <div className="flex items-center gap-2">
+        <Button
+          type="button"
+          onClick={() => void start()}
+          disabled={starting || !path.trim()}
+        >
+          {starting ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+          {running ? "Restart test" : "Play test"}
+        </Button>
+        {running && (
+          <Button type="button" variant="secondary" onClick={() => void stop()}>
+            Stop
+          </Button>
+        )}
+      </div>
+
+      {status?.error && (
+        <p className="text-xs text-destructive">{status.error}</p>
+      )}
+
+      {running && status && (
+        <div className="rounded-md border border-border/60 p-3 text-xs">
+          <div className="mb-1 flex items-center justify-between">
+            <span className="font-medium capitalize">
+              {status.state}
+              {status.duration_ms > 0 &&
+              status.position_ms >= status.duration_ms - 500 &&
+              status.state !== "playing"
+                ? " — finished"
+                : ""}
+            </span>
+            <span className="font-mono text-muted-foreground">
+              {formatDuration(status.position_ms / 1000)} /{" "}
+              {formatDuration(status.duration_ms / 1000)}
+            </span>
+          </div>
+          <div className="mb-2 h-1.5 overflow-hidden rounded bg-secondary">
+            <div
+              className="h-full rounded bg-primary transition-[width] duration-300"
+              style={{ width: `${pct}%` }}
+            />
+          </div>
+
+          {status.engine === "windows" ? (
+            <div className="space-y-1">
+              <div className="flex flex-wrap gap-x-4 gap-y-1">
+                <span>
+                  Output:{" "}
+                  <span className="font-mono">
+                    {status.detail.device || "(unknown)"}
+                  </span>
+                </span>
+                <span>
+                  Helper:{" "}
+                  <span className="font-mono">
+                    {status.detail.helper_running ? "running" : "stopped"}
+                  </span>
+                </span>
+              </div>
+              <div>
+                Decoder modules:{" "}
+                {(status.detail.decoders ?? []).length > 0 ? (
+                  <span className="font-mono">
+                    {(status.detail.decoders ?? []).join(", ")}
+                  </span>
+                ) : (
+                  <span className="text-muted-foreground">none loaded</span>
+                )}
+              </div>
+              <p
+                className={cn(
+                  "pt-1",
+                  dolbyLoaded ? "text-emerald-400" : "text-amber-400",
+                )}
+              >
+                {dolbyLoaded
+                  ? "Dolby's decoder is active — object audio is being rendered to the spatial renderer. You should hear heights/overhead positions."
+                  : "No Dolby decoder module is loaded. MediaPlayer may be using a different decoder, so this test cannot confirm object rendering."}
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-1">
+              <div className="flex flex-wrap gap-x-4 gap-y-1">
+                <span>
+                  Host API:{" "}
+                  <span className="font-mono">
+                    {status.detail.output?.hostapi ?? "?"}
+                  </span>
+                </span>
+                <span>
+                  Device:{" "}
+                  <span className="font-mono">
+                    {status.detail.output?.device_name ?? "default"}
+                  </span>
+                </span>
+                <span>
+                  Stream:{" "}
+                  <span className="font-mono">
+                    {status.detail.output?.channels ?? "?"} ch @{" "}
+                    {status.detail.output?.sample_rate_hz ?? "?"} Hz
+                  </span>
+                </span>
+                <span>
+                  Source:{" "}
+                  <span className="font-mono">
+                    {status.detail.output?.source_channels ?? "?"} ch
+                  </span>
+                </span>
+              </div>
+              <p className="pt-1 text-amber-400">
+                PyAV renders the core bed only — the JOC object layer is dropped
+                before the speakers. This is what Tideway sounds like without
+                the Windows pipeline.
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
  * ReplayGain loudness leveling. Three modes (off / track / album)
  * + a preamp slider + a clipping-prevention toggle. Self-contained
  * on settings.get/put, same pattern as CrossfeedField.
@@ -988,7 +1394,7 @@ function ReplayGainField() {
   return (
     <Field
       label="ReplayGain"
-      hint="Loudness leveling — Tidal masters carry per-track and per-album gain offsets relative to the EBU R128 reference. Track mode is best for shuffle; album mode preserves the artist's intended loudness relationships within an album. Off keeps the audio path bit-perfect."
+      hint="Loudness leveling — Tidal masters carry per-track and per-album gain offsets relative to the EBU R128 reference. Track mode is best for shuffle; album mode preserves the artist's intended loudness relationships within an album. Off keeps the audio path bit-perfect. Everything lands on -16 LUFS, the same target Apple Music's Sound Check uses: downloaded files carry no tags, so they are measured locally (EBU R128), and TIDAL's stream tags (which aim at -14) are re-referenced to -16. The Windows Atmos path can only attenuate, since MediaPlayer has no headroom above full volume."
     >
       <div className="flex flex-col gap-3">
         <select

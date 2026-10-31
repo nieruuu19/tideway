@@ -16,8 +16,10 @@ from typing import Any, Callable, Dict, Optional
 
 import tidalapi
 
+from app import atmos as atmos_mod
 from app.http import SESSION
 from app.paths import user_data_dir
+from app.tidal_client import is_lossy_quality, request_stream_manifest
 
 # Where the downloader persists its pending-queue snapshot. Written on
 # each add/clear, consumed once per process by restore(). Lives next to
@@ -170,6 +172,9 @@ _TRACK_SIZE_ESTIMATE_MB = {
     "low_320k": 8,
     "high_lossless": 40,
     "hi_res_lossless": 90,
+    # E-AC-3 JOC tops out around 768 kbps (~25 MB per 4-minute track),
+    # well under lossless, but keep the estimate generous.
+    "atmos": 30,
 }
 _DEFAULT_TRACK_SIZE_MB = 40  # when quality is None or unknown, assume Lossless.
 # Free-space safety margin: keep this much space free on the drive
@@ -1371,11 +1376,52 @@ class Downloader:
                 file=_sys.stderr,
                 flush=True,
             )
-            urls, ext_hint, codec = self._fetch_stream_sources(
-                track, item.quality, item_id=item.item_id
-            )
+            if (item.quality or "").strip().lower() == "atmos":
+                try:
+                    urls, ext_hint, codec = self._fetch_atmos_sources(
+                        track, item_id=item.item_id
+                    )
+                except atmos_mod.AtmosUnavailable as exc:
+                    # Same fallback as playback: a release without an
+                    # Atmos mix gets the best stereo tier the account
+                    # holds instead of a failed row. Rewrite the item's
+                    # quality so the queue reports what will actually
+                    # land on disk.
+                    fallback = self.tidal.get_max_quality() or "high_lossless"
+                    print(
+                        f"[downloader] Atmos unavailable for track "
+                        f"{getattr(track, 'id', '?')} ({exc}); "
+                        f"falling back to {fallback}",
+                        file=_sys.stderr,
+                        flush=True,
+                    )
+                    item.quality = fallback
+                    self._publish_update(item)
+                    urls, ext_hint, codec, delivered = self._fetch_stream_sources(
+                        track, item.quality, item_id=item.item_id
+                    )
+            else:
+                urls, ext_hint, codec, delivered = self._fetch_stream_sources(
+                    track, item.quality, item_id=item.item_id
+                )
             if not urls:
                 raise RuntimeError("Tidal returned no stream URLs")
+            # TIDAL sometimes answers a lossless request with the lossy
+            # tier (client not entitled for that asset). The file is
+            # fine, but the queue must not keep claiming "Lossless" for
+            # an AAC download — rewrite the row to the tier that landed.
+            if delivered and is_lossy_quality(delivered) and not is_lossy_quality(
+                item.quality
+            ):
+                print(
+                    f"[downloader] id={item.item_id[:8]} requested "
+                    f"{item.quality!r} but TIDAL served {delivered!r} "
+                    f"(track_id={getattr(track, 'id', '?')})",
+                    file=_sys.stderr,
+                    flush=True,
+                )
+                item.quality = delivered
+                self._publish_update(item)
             print(
                 f"[downloader] _download id={item.item_id[:8]} got "
                 f"{len(urls)} URL(s) ext_hint={ext_hint!r} codec={codec!r}",
@@ -1815,18 +1861,21 @@ class Downloader:
 
     def _fetch_stream_sources(
         self, track, quality: Optional[str], item_id: Optional[str] = None
-    ) -> tuple[list[str], Optional[str], Optional[str]]:
+    ) -> tuple[list[str], Optional[str], Optional[str], Optional[str]]:
         """Fetch the list of URLs we need to download, a file-extension
-        hint, and the audio codec. Handles both session types:
+        hint, the audio codec, and the tier TIDAL actually served.
 
-        * Device-code sessions use `track.get_url()` — a single streamable
-          URL. One entry in the returned list, no extension or codec hint.
-        * PKCE sessions can't call get_url (tidalapi raises URLNotAvailable
-          immediately). They use `track.get_stream()` which returns a
-          manifest (MPEG-DASH or BTS) whose `urls` is a list of segment
-          URLs. For DASH hi-res content that list may have dozens of
-          short segments which we concatenate into one FLAC file. The
-          manifest also carries a file_extension hint and a codec name.
+        Both session types resolve through
+        `request_stream_manifest()` (the `playbackinfopostpaywall`
+        endpoint): it is the only one that serves lossless — the legacy
+        `urlpostpaywall` behind `Track.get_url()` answers AAC 320
+        regardless of the tier asked for, which is how Lossless/Max
+        downloads used to land as `.m4a` AAC. `get_url()` is kept as a
+        fallback for tracks that have no manifest at all.
+
+        `manifest.urls` is a list of MPEG-DASH segments for hi-res FLAC
+        and a single entry for the BTS (AAC) manifests; the caller
+        concatenates them, so both shapes look the same here.
 
         The codec is the source of truth for what's actually inside the
         bytes — tidalapi's file_extension hint looks at the URL string
@@ -1845,29 +1894,47 @@ class Downloader:
             except KeyError:
                 override = None
 
-        def _call() -> tuple[list[str], Optional[str], Optional[str]]:
+        def _call() -> tuple[
+            list[str], Optional[str], Optional[str], Optional[str]
+        ]:
             with self.quality_lock:
                 original = self.tidal.session.config.quality
                 try:
                     if override is not None:
                         self.tidal.session.config.quality = override
-                    if getattr(self.tidal.session, "is_pkce", False):
-                        # PKCE path: manifest-based stream.
-                        stream = track.get_stream()
-                        manifest = stream.get_stream_manifest()
-                        if getattr(manifest, "is_encrypted", False):
-                            # Encrypted streams would need per-segment
-                            # decryption keys we don't have. Refuse
-                            # loudly rather than write a corrupt file.
-                            raise RuntimeError(
-                                "Tidal returned an encrypted stream we can't decrypt"
-                            )
-                        ext_hint = getattr(manifest, "file_extension", None)
-                        codec = getattr(manifest, "codecs", None)
-                        codec = codec.upper() if isinstance(codec, str) else None
-                        return (list(manifest.urls or []), ext_hint, codec)
-                    # Device-code path: single direct URL.
-                    return ([track.get_url()], None, None)
+                    try:
+                        stream, manifest, delivered = request_stream_manifest(
+                            self.tidal.session, track
+                        )
+                    except (
+                        tidalapi.exceptions.StreamNotAvailable,
+                        tidalapi.exceptions.URLNotAvailable,
+                    ):
+                        if getattr(self.tidal.session, "is_pkce", False):
+                            raise
+                        # No manifest on this track (old catalogue /
+                        # podcasts): the legacy endpoint still hands out a
+                        # plain URL. It only ever answers the lossy tier,
+                        # so the delivered tier is unknown and the caller
+                        # reports what actually landed from the bytes.
+                        print(
+                            f"[downloader] no manifest for track "
+                            f"{getattr(track, 'id', '?')}; using get_url()",
+                            file=_sys.stderr,
+                            flush=True,
+                        )
+                        return ([track.get_url()], None, None, None)
+                    if getattr(manifest, "is_encrypted", False):
+                        # Encrypted streams would need per-segment
+                        # decryption keys we don't have. Refuse
+                        # loudly rather than write a corrupt file.
+                        raise RuntimeError(
+                            "Tidal returned an encrypted stream we can't decrypt"
+                        )
+                    ext_hint = getattr(manifest, "file_extension", None)
+                    codec = getattr(manifest, "codecs", None)
+                    codec = codec.upper() if isinstance(codec, str) else None
+                    return (list(manifest.urls or []), ext_hint, codec, delivered)
                 finally:
                     if override is not None:
                         self.tidal.session.config.quality = original
@@ -1908,6 +1975,88 @@ class Downloader:
                         return _call()
                 raise
         # Exhausted the rate-limit retry budget — surface the last 429.
+        assert last_exc is not None
+        raise last_exc
+
+    def _fetch_atmos_sources(
+        self, track, item_id: Optional[str] = None
+    ) -> tuple[list[str], Optional[str], Optional[str]]:
+        """Resolve the E-AC-3 JOC DASH segments for `track`.
+
+        Atmos lives outside tidalapi's quality ladder: the stream only
+        exists on the OpenAPI `trackManifests` endpoint, usually under a
+        separate catalog id (the Atmos edition). `find_atmos_track_id`
+        resolves that twin, and `fetch_atmos_stream` expands the manifest
+        into the same [init, segment, ...] URL list the normal DASH path
+        concatenates into one file. The result is a fragmented MP4, so
+        the saved extension is `.m4a`.
+
+        Raises `AtmosUnavailable` when TIDAL has no Atmos asset for the
+        release — the caller falls back to Max. Rate limits and auth
+        errors propagate so the shared backoff / refresh paths handle
+        them like any other stream fetch.
+        """
+        import sys as _sys
+
+        track_id = getattr(track, "id", None)
+        if track_id is None:
+            raise atmos_mod.AtmosUnavailable("Track id unavailable.")
+        session = self.tidal.session
+
+        def _call() -> tuple[list[str], Optional[str], Optional[str]]:
+            candidates: list[int] = []
+            twin_id = atmos_mod.find_atmos_track_id(session, track)
+            if twin_id is not None:
+                candidates.append(twin_id)
+            try:
+                own_id = int(track_id)
+            except (TypeError, ValueError):
+                own_id = None
+            if own_id is not None and own_id not in candidates:
+                # Catalog metadata can lag entitlements; the manifest
+                # service is authoritative, so always try the clicked id.
+                candidates.append(own_id)
+
+            last_error: Optional[atmos_mod.AtmosUnavailable] = None
+            for candidate in candidates:
+                try:
+                    stream = atmos_mod.fetch_atmos_stream(session, candidate)
+                except atmos_mod.AtmosUnavailable as exc:
+                    last_error = exc
+                    continue
+                print(
+                    f"[downloader] Atmos stream track_id={track_id} "
+                    f"asset_id={candidate} urls={len(stream.urls)} "
+                    f"codec={stream.codec!r}",
+                    file=_sys.stderr,
+                    flush=True,
+                )
+                return (
+                    list(stream.urls),
+                    ".m4a",
+                    (stream.codec or "ec-3").upper(),
+                )
+            raise last_error or atmos_mod.AtmosUnavailable(
+                "Dolby Atmos stream is not available for this track."
+            )
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(RATE_LIMIT_MAX_ATTEMPTS):
+            self._wait_for_rate_limit(item_id)
+            try:
+                return _call()
+            except atmos_mod.AtmosUnavailable:
+                raise
+            except Exception as exc:
+                last_exc = exc
+                if _looks_like_rate_limit(exc):
+                    self._note_rate_limit(exc, attempt)
+                    continue
+                if _looks_like_auth_error(exc):
+                    refresh = getattr(self.tidal, "force_refresh", None)
+                    if callable(refresh) and refresh():
+                        return _call()
+                raise
         assert last_exc is not None
         raise last_exc
 
@@ -2411,6 +2560,20 @@ def _template_has_separator(template: str) -> bool:
     return "/" in stripped or "\\" in stripped
 
 
+def _wants_atmos_suffix(item: DownloadItem, settings) -> bool:
+    """Whether the filename needs a " [Dolby Atmos]" marker.
+
+    TIDAL's Atmos edition reuses the track's title, so the stereo and
+    Atmos files would share a stem and the skip-existing check would
+    mistake one for the other. A template that already encodes quality
+    doesn't need the extra marker.
+    """
+    if (item.quality or "").strip().lower() != "atmos":
+        return False
+    template = getattr(settings, "filename_template", "") or ""
+    return "{StreamQuality}" not in template and "{Codec}" not in template
+
+
 def _build_path(item: DownloadItem, settings, ext: str) -> Path:
     """Render the user's filename template into an absolute output
     path under settings.output_dir.
@@ -2487,6 +2650,13 @@ def _build_path(item: DownloadItem, settings, ext: str) -> Path:
             base = base / _sanitize_segment(folder_name)
 
     *dirs, last = safe_segments
+    # Atmos shares its title with the stereo edition of the same track.
+    # Without a marker, skip-existing would treat an existing stereo
+    # FLAC as "already downloaded" and decline the Atmos file (or the
+    # other way around on a template collision). Re-sanitize because
+    # the suffix pushes the segment back over the length cap.
+    if _wants_atmos_suffix(item, settings):
+        last = _sanitize_segment(f"{last} [Dolby Atmos]")
     final = base
     for d in dirs:
         final = final / d

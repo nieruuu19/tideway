@@ -122,3 +122,91 @@ def test_duplicate_name_prefers_wasapi_on_windows(monkeypatch):
         output_devices, "wasapi_host_api_index", lambda: 3
     )
     assert output_devices.resolve_output_device("Speakers") == (1, True)
+
+
+# ---------------------------------------------------------------------------
+# Surround routing: the WASAPI copy of an endpoint often reports a stereo
+# mix format even when the OS spatial APO has a 5.1/7.1 bed, while the
+# MME/DirectSound copies accept the real layout.
+# ---------------------------------------------------------------------------
+
+_HOSTAPIS = [
+    {"name": "MME"},
+    {"name": "Windows DirectSound"},
+    {"name": "Windows WASAPI"},
+]
+
+_SURROUND_DEVICES = [
+    {"name": "Speakers", "max_output_channels": 8,
+     "max_input_channels": 0, "hostapi": 0},   # MME
+    {"name": "Speakers", "max_output_channels": 8,
+     "max_input_channels": 0, "hostapi": 1},   # DirectSound
+    {"name": "Speakers", "max_output_channels": 2,
+     "max_input_channels": 0, "hostapi": 2},   # WASAPI
+    {"name": "Headphones", "max_output_channels": 8,
+     "max_input_channels": 0, "hostapi": 0},   # other device
+]
+
+
+def _patch_surround(monkeypatch, accepting):
+    monkeypatch.setattr(
+        output_devices.sd, "query_devices",
+        lambda *a, **kw: _SURROUND_DEVICES if not a and not kw
+        else _SURROUND_DEVICES[2],
+    )
+    monkeypatch.setattr(
+        output_devices.sd, "query_hostapis",
+        lambda index: _HOSTAPIS[index],
+    )
+    monkeypatch.setattr(
+        output_devices.sd, "check_output_settings",
+        lambda **kw: None if kw["device"] in accepting
+        else (_ for _ in ()).throw(RuntimeError("Invalid number of channels")),
+    )
+
+
+def test_surround_resolver_prefers_mme_copy(monkeypatch):
+    """MME accepts the bed, WASAPI does not → the MME copy wins even
+    though WASAPI is what the picker showed."""
+    _patch_surround(monkeypatch, accepting={0})
+
+    assert output_devices.resolve_surround_output_device(
+        "Speakers", 6, 48000, "float32"
+    ) == (0, "mme")
+
+
+def test_surround_resolver_prefers_directsound_over_mme(monkeypatch):
+    _patch_surround(monkeypatch, accepting={1})
+
+    assert output_devices.resolve_surround_output_device(
+        "Speakers", 6, 48000, "float32"
+    ) == (1, "windows directsound")
+
+
+def test_surround_resolver_returns_none_when_no_copy_accepts(monkeypatch):
+    _patch_surround(monkeypatch, accepting=set())
+
+    assert output_devices.resolve_surround_output_device(
+        "Speakers", 6, 48000, "float32"
+    ) == (None, None)
+
+
+def test_surround_resolver_never_switches_to_another_device(monkeypatch):
+    """Headphones also accept the bed, but the user picked Speakers."""
+    _patch_surround(monkeypatch, accepting={0, 3})
+
+    index, _ = output_devices.resolve_surround_output_device(
+        "Speakers", 6, 48000, "float32"
+    )
+
+    assert index == 0
+
+
+def test_surround_resolver_uses_default_device_name(monkeypatch):
+    """With no saved selection the system default's *name* is used, so
+    the fallback still lands on that same logical device."""
+    _patch_surround(monkeypatch, accepting={0})
+
+    assert output_devices.resolve_surround_output_device(
+        "", 6, 48000, "float32"
+    ) == (0, "mme")

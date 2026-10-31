@@ -71,6 +71,14 @@ class LocalIndex:
             return None
         return path
 
+    def paths(self) -> list[tuple[str, Path]]:
+        """Every live (track_id, path) pair. Used by the Atmos test
+        panel to offer already-downloaded Atmos tracks without asking
+        the user to type a filesystem path."""
+        with self._lock:
+            snapshot = list(self._by_id.items())
+        return [(tid, path) for tid, path in snapshot if path.exists()]
+
     def ids(self) -> set[str]:
         with self._lock:
             snapshot = dict(self._by_id)

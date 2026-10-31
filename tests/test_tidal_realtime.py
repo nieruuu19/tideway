@@ -270,3 +270,107 @@ def test_dispatch_ignores_unknown_frame_type():
     )
     assert ws.closed is False
     assert listener.status().events_received == 0
+
+
+# ---------------------------------------------------------------------------
+# Self-event filtering
+# ---------------------------------------------------------------------------
+
+
+def _frame(session_id: str, display_name: str = "Android Automotive") -> dict:
+    return {
+        "type": "PRIVILEGED_SESSION_NOTIFICATION",
+        "payload": {
+            "clientDisplayName": display_name,
+            "sessionId": session_id,
+        },
+    }
+
+
+def _boom_provider():
+    raise RuntimeError("provider down")
+
+
+def test_dispatch_ignores_notification_for_our_own_session():
+    """Tidal echoes our own playback back with our session id. Firing
+    the pause callback on that would pause Tideway the instant it
+    started playing — the bug this filter exists for."""
+    received: list = []
+    listener = RealtimeListener(
+        token_provider=_noop_token,
+        on_other_device_started=received.append,
+        session_id_provider=lambda: "our-sid",
+    )
+    asyncio.run(listener._dispatch_frame(_frame("our-sid"), _FakeWS()))
+
+    assert received == []
+    s = listener.status()
+    assert s.events_received == 0
+    assert s.self_events_ignored == 1
+
+
+def test_dispatch_fires_for_a_different_session():
+    received: list = []
+    listener = RealtimeListener(
+        token_provider=_noop_token,
+        on_other_device_started=received.append,
+        session_id_provider=lambda: "our-sid",
+    )
+    asyncio.run(listener._dispatch_frame(_frame("phone-sid", "iOS"), _FakeWS()))
+
+    assert len(received) == 1
+    s = listener.status()
+    assert s.events_received == 1
+    assert s.self_events_ignored == 0
+
+
+def test_dispatch_without_session_id_provider_still_pauses():
+    """Backward-compatible posture: no provider means we can't tell
+    the notification apart from another device's, so deliver it."""
+    received: list = []
+    listener = RealtimeListener(
+        token_provider=_noop_token,
+        on_other_device_started=received.append,
+    )
+    asyncio.run(listener._dispatch_frame(_frame("our-sid"), _FakeWS()))
+    assert len(received) == 1
+
+
+def test_dispatch_fails_open_when_provider_raises():
+    received: list = []
+    listener = RealtimeListener(
+        token_provider=_noop_token,
+        on_other_device_started=received.append,
+        session_id_provider=_boom_provider,
+    )
+    asyncio.run(listener._dispatch_frame(_frame("our-sid"), _FakeWS()))
+    assert len(received) == 1
+    assert listener.status().self_events_ignored == 0
+
+
+def test_dispatch_ignores_notification_without_session_id():
+    """Legacy frames without a sessionId can't be matched, so they
+    keep the pre-filter behavior and fire the callback."""
+    received: list = []
+    listener = RealtimeListener(
+        token_provider=_noop_token,
+        on_other_device_started=received.append,
+        session_id_provider=lambda: "our-sid",
+    )
+    asyncio.run(
+        listener._dispatch_frame(
+            {"type": "PRIVILEGED_SESSION_NOTIFICATION", "payload": {}},
+            _FakeWS(),
+        )
+    )
+    assert len(received) == 1
+
+
+def test_status_snapshot_carries_self_events_ignored():
+    listener = RealtimeListener(
+        token_provider=_noop_token,
+        on_other_device_started=_noop_callback,
+        session_id_provider=lambda: "our-sid",
+    )
+    asyncio.run(listener._dispatch_frame(_frame("our-sid"), _FakeWS()))
+    assert listener.status().self_events_ignored == 1

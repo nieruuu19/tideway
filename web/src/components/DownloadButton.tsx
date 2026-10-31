@@ -21,6 +21,7 @@ import {
   filterAvailableQualities,
   unionTrackMediaTags,
 } from "@/lib/quality";
+import { QUALITY_TONE } from "@/lib/qualityTiers";
 import { cn } from "@/lib/utils";
 
 interface Props {
@@ -170,7 +171,17 @@ export function DownloadButton({
                     {q.codec}
                   </span>
                   {effective && (
-                    <span className="rounded bg-primary/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-primary">
+                    <span
+                      className={cn(
+                        "rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider",
+                        // "Hi-Res" means Max really delivers 24-bit here;
+                        // "Same as High" means picking Max buys you the
+                        // CD-res file, so it takes High's sky.
+                        effective === "Hi-Res"
+                          ? QUALITY_TONE.max.badge
+                          : QUALITY_TONE.high.badge,
+                      )}
+                    >
                       {effective}
                     </span>
                   )}

@@ -147,6 +147,20 @@ def _decode_jwt_claims(token: str) -> dict:
         return {}
 
 
+def session_id_from_token(token: Optional[str]) -> Optional[str]:
+    """The `sid` claim of a Tidal access token, or None.
+
+    This is the session id Tidal's realtime bus stamps on events
+    originating from us. The Pushkin listener compares it against the
+    `sessionId` of an incoming PRIVILEGED_SESSION_NOTIFICATION to tell
+    our own echo apart from another device's playback.
+    """
+    if not token:
+        return None
+    sid = _decode_jwt_claims(token).get("sid")
+    return str(sid) if sid else None
+
+
 def _playback_session_payload(session: PlaySession) -> dict:
     """Inner `payload.*` fields for a playback_session event.
 

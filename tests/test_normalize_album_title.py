@@ -49,10 +49,9 @@ def test_normalizes(raw: str, expected: str) -> None:
 
 
 def test_no_infinite_loop_on_pathological_input() -> None:
-    """The normalizer's strip loop is bounded at 4 iterations so a
-    malformed title with infinite nested parens can't hang. Verify
-    a torture-test input returns in finite time and produces a
-    plausible result."""
+    """The normalizer's strip loop is bounded so a malformed title with
+    endless nested parens can't hang. Verify a torture-test input
+    returns in finite time and produces a plausible result."""
     raw = "Album " + "(x)" * 50
     out = _normalize_album_title(raw)
     # Don't assert exact output (the loop bound stops mid-strip),

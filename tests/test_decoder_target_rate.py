@@ -26,6 +26,8 @@ def _make_skeleton(source_rate: int = 48000, source_format: str = "s32"):
     dec = Decoder.__new__(Decoder)
     out_fmt, dtype, sd_dtype, bit_depth = _FORMAT_MAP[source_format]
     dec._sample_rate = source_rate
+    dec._source_channels = 2
+    dec._output_channels = 2
     dec._source_format = source_format
     dec._source_format_packed = out_fmt
     dec._source_dtype = dtype

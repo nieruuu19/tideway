@@ -22,6 +22,7 @@ import {
   filterAvailableQualities,
   unionTrackMediaTags,
 } from "@/lib/quality";
+import { QUALITY_TONE } from "@/lib/qualityTiers";
 import { cn } from "@/lib/utils";
 
 /**
@@ -145,7 +146,14 @@ export function DownloadAlbumButton({
                     {q.codec}
                   </span>
                   {effective && (
-                    <span className="rounded bg-primary/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-primary">
+                    <span
+                      className={cn(
+                        "rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider",
+                        effective === "Hi-Res"
+                          ? QUALITY_TONE.max.badge
+                          : QUALITY_TONE.high.badge,
+                      )}
+                    >
                       {effective}
                     </span>
                   )}

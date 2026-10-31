@@ -10,8 +10,10 @@ import { api } from "@/api/client";
 import {
   buildShuffleOrder,
   fetchRadioTakeover,
+  nearestQueueIndex,
   pickNextIndex,
   pickPrevIndex,
+  shouldSkipOnError,
   shuffleOrderAfterInsert,
   shuffleOrderAfterRemove,
   shuffleTracks,
@@ -112,6 +114,35 @@ describe("pickPrevIndex", () => {
       shuffle: true,
     });
     expect(pickPrevIndex(s)).toBe(0);
+  });
+});
+
+describe("shouldSkipOnError", () => {
+  it("skips an unplayable track while autoplay is on", () => {
+    expect(shouldSkipOnError({ state: "error", error_kind: null }, true)).toBe(
+      true,
+    );
+  });
+
+  it("never skips when the user stopped autoplay", () => {
+    expect(shouldSkipOnError({ state: "error", error_kind: null }, false)).toBe(
+      false,
+    );
+  });
+
+  it("holds the queue when Tidal is rate-limiting", () => {
+    // Skipping would walk the whole queue into the same closed gate —
+    // 13 track failures per album in the 2026-10-28 log — and every
+    // attempt counts against the account.
+    expect(
+      shouldSkipOnError({ state: "error", error_kind: "backoff" }, true),
+    ).toBe(false);
+  });
+
+  it("ignores non-error frames", () => {
+    expect(
+      shouldSkipOnError({ state: "playing", error_kind: null }, true),
+    ).toBe(false);
   });
 });
 
@@ -329,5 +360,38 @@ describe("fetchRadioTakeover", () => {
   it("returns null on an empty queue", async () => {
     const res = await fetchRadioTakeover(_state({ queue: [], queueIndex: -1 }));
     expect(res).toBeNull();
+  });
+});
+
+describe("nearestQueueIndex", () => {
+  it("returns -1 for an empty queue", () => {
+    expect(nearestQueueIndex([], "1", 0)).toBe(-1);
+  });
+
+  it("returns -1 when the id is not queued", () => {
+    expect(nearestQueueIndex([_track("1"), _track("2")], "9", 0)).toBe(-1);
+  });
+
+  it("searches forward from the current position", () => {
+    const queue = [_track("1"), _track("2"), _track("3")];
+    expect(nearestQueueIndex(queue, "3", 1)).toBe(2);
+  });
+
+  it("wraps around when the only match sits before the cursor", () => {
+    const queue = [_track("1"), _track("2"), _track("3")];
+    expect(nearestQueueIndex(queue, "1", 2)).toBe(0);
+  });
+
+  it("keeps duplicate tracks distinct", () => {
+    // A playlist may contain the same track twice; resyncing must not
+    // jump back to the earlier copy and replay half the queue.
+    const queue = [_track("1"), _track("2"), _track("1"), _track("3")];
+    expect(nearestQueueIndex(queue, "1", 2)).toBe(2);
+    expect(nearestQueueIndex(queue, "1", 0)).toBe(0);
+  });
+
+  it("starts at the head for a negative cursor", () => {
+    const queue = [_track("1"), _track("2")];
+    expect(nearestQueueIndex(queue, "2", -1)).toBe(1);
   });
 });

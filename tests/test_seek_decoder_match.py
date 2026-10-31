@@ -148,3 +148,22 @@ def test_seek_asks_for_float_when_the_stream_is_float_at_the_source_rate():
         p._restart_decoder_at(target_s=5.0)
 
     fake_decoder.set_target_rate.assert_called_once_with(44100, float_output=True)
+
+
+def test_single_url_source_seeks_through_the_container():
+    """The AAC tiers' manifest names one progressive MP4, so there is no
+    later segment to slice to. Returning offset 0.0 told the player the
+    new reader already started at the target — every Low-tier seek
+    restarted at 0:00. The source comes back with "unknown offset" and
+    the decoder seeks the MP4 sample table instead."""
+    p = PCMPlayer.__new__(PCMPlayer)
+    p._source_urls = ["https://cdn/aac.m4a"]
+    p._source_path = None
+    p._current_duration_ms = 200_000
+
+    with patch("app.audio.player.SegmentReader") as reader_cls:
+        source, offset = p._build_source_at(120.0)
+
+    assert offset is None
+    reader_cls.assert_called_once_with(["https://cdn/aac.m4a"])
+    assert source is reader_cls.return_value

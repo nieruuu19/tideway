@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "@/api/client";
 import { clearApiCache } from "@/hooks/useApi";
+import { retryBoot } from "@/lib/bootRetry";
 import type { AuthStatus } from "@/api/types";
 
 export function useAuth() {
@@ -14,7 +15,13 @@ export function useAuth() {
 
   const refresh = useCallback(async () => {
     try {
-      const s = await api.auth.status();
+      // Ride out the launch race: while the backend is still importing,
+      // the Vite proxy answers ECONNREFUSED, and treating that as
+      // "signed out" painted the login screen over a valid session
+      // (which then pulled the user through a needless re-auth).
+      // `loading` stays true through the retries, so the shell keeps
+      // showing its boot spinner instead.
+      const s = await retryBoot(() => api.auth.status());
       setState({ ...s, loading: false });
     } catch {
       setState({

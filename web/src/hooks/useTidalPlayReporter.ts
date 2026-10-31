@@ -177,7 +177,13 @@ export function useTidalPlayReporter(): void {
   }, [streamingQuality]);
 }
 
-/** Map our internal quality codes to Tidal's event-producer enum. */
+/** Map our internal quality codes to Tidal's event-producer enum.
+ *
+ *  The enum has no Atmos member — Dolby Atmos is expressed through
+ *  `actualAudioMode` (DOLBY_ATMOS) alongside one of the four stereo
+ *  qualities. We report the Atmos preference as HI_RES_LOSSLESS: it's
+ *  the tier gate that unlocks Atmos, so it's the closest honest match
+ *  for a listener on that preference. */
 function toTidalQuality(q: StreamingQuality): string {
   switch (q) {
     case "low_96k":
@@ -187,6 +193,8 @@ function toTidalQuality(q: StreamingQuality): string {
     case "high_lossless":
       return "LOSSLESS";
     case "hi_res_lossless":
+      return "HI_RES_LOSSLESS";
+    case "atmos":
       return "HI_RES_LOSSLESS";
   }
 }

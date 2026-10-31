@@ -95,7 +95,10 @@ def test_device_loss_path_does_not_null_stream():
     p._pcm_queue = queue.Queue()
     p._decoder_done = threading.Event()
     # decoder NOT done -> device-loss heuristic should fire and
-    # spawn the recovery thread, leaving self._stream alone.
+    # spawn the recovery thread, leaving self._stream alone. Stub
+    # recovery: the real one immediately takes ownership of
+    # `self._stream`, which is exactly what this test is not about.
+    p._recover_from_device_loss = lambda: None
 
     p._on_stream_finished()
 
@@ -104,3 +107,101 @@ def test_device_loss_path_does_not_null_stream():
         "needs to reopen on a fresh device"
     )
     assert not fake.closed
+
+
+class _NoopStream:
+    """Structurally enough for `_on_stream_finished`; `active` is what
+    the watchdog and the recovery paths look at."""
+
+    def __init__(self, active: bool = True) -> None:
+        self.active = active
+
+    def close(self) -> None:
+        pass
+
+
+def _wait_recovery(p) -> bool:
+    done = threading.Event()
+    calls: list[int] = []
+
+    def _recover() -> None:
+        calls.append(1)
+        done.set()
+
+    p._recover_from_device_loss = _recover
+    p._on_stream_finished()
+    return done.wait(2.0) and bool(calls)
+
+
+def test_paused_stream_ending_recovers_instead_of_ending():
+    """Enabling Spatial Sound kills the stream while the user is
+    paused. The callback never drains while paused, so this can't be
+    end-of-track; emitting `ended` would make the frontend advance."""
+    p = _player()
+    p._stream = _NoopStream()
+    p._state = "paused"
+    p._replacing_stream = False
+    p._preload = None
+    p._pcm_queue = queue.Queue()
+    p._decoder_done = threading.Event()
+
+    assert _wait_recovery(p) is True
+
+    assert p._state == "paused"
+
+
+def test_device_loss_with_a_preload_armed_recovers_the_current_track():
+    """A preload no longer exempts the stream from recovery: bridging
+    to the next track on a dead endpoint just moved the failure one
+    track later. The preload must survive for the real transition."""
+    p = _player()
+    p._stream = _NoopStream()
+    p._state = "playing"
+    p._replacing_stream = False
+    pre = object()
+    p._preload = pre
+    p._pcm_queue = queue.Queue()
+    p._decoder_done = threading.Event()
+
+    assert _wait_recovery(p) is True
+
+    assert p._preload is pre
+    assert p._state == "playing"
+
+
+def test_watchdog_recovers_a_stream_that_died_silently():
+    p = _player()
+    p._stream = _NoopStream(active=False)
+    p._state = "playing"
+    p._replacing_stream = False
+    p._last_watchdog_recover_t = 0.0
+    done = threading.Event()
+    p._recover_from_device_loss = lambda: done.set()
+
+    assert p._watchdog_recover_dead_stream(p._stream) is True
+    assert done.wait(2.0)
+
+
+def test_watchdog_leaves_a_live_stream_alone():
+    p = _player()
+    live = _NoopStream(active=True)
+    p._replacing_stream = False
+    spawned: list[int] = []
+    p._recover_from_device_loss = lambda: spawned.append(1)
+
+    assert p._watchdog_recover_dead_stream(live) is False
+    assert spawned == []
+
+
+def test_watchdog_rate_limits_recovery():
+    p = _player()
+    p._replacing_stream = False
+    p._last_watchdog_recover_t = 0.0
+    spawned: list[int] = []
+    p._recover_from_device_loss = lambda: spawned.append(1)
+
+    first = p._watchdog_recover_dead_stream(_NoopStream(active=False))
+    second = p._watchdog_recover_dead_stream(_NoopStream(active=False))
+
+    assert first is True
+    assert second is False

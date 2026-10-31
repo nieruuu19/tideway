@@ -27,22 +27,28 @@ Threading model:
 from __future__ import annotations
 
 import faulthandler
+import json
 import logging
 import math
 import os
 import queue
+import shutil
 import sys
+import tempfile
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Callable, Optional, Union
 
 import numpy as np
 import sounddevice as sd  # type: ignore
 import tidalapi
 
+from app import atmos as atmos_mod
+from app.audio import pa_guard
 from app.http import STREAM_SESSION
 from app.audio.decoder import Decoder
 from app.audio.crossfade import mix_crossfade_block
@@ -59,12 +65,25 @@ from app.audio.replaygain import (
     ReplayGain,
     ReplayGainMode,
     ReplayGainTags,
+    TIDAL_TAG_REFERENCE_LUFS,
     VALID_MODES as REPLAYGAIN_VALID_MODES,
     compute_gain_db as compute_replaygain_db,
+    compute_measured_gain_db,
 )
-from app.audio.output_devices import list_output_devices, resolve_output_device
+from app.audio.output_devices import (
+    list_output_devices,
+    resolve_fallback_output_device,
+    resolve_output_device,
+    resolve_surround_output_device,
+)
+from app.audio import native_atmos
+from app.audio import loudness
+from app.audio.atmos_dash import DashPublication, dash_server
+from app.audio.native_atmos import NativeAtmosPlayer
 from app.audio.segment_reader import SegmentReader
+from app.audio.stream_cache import StreamCache
 from app.audio.win_com import ensure_com_initialized
+from app.paths import user_data_dir
 
 # Optional audio output taps. Imported at module load (not lazily
 # from inside the audio callback) because Python's `import` statement
@@ -155,6 +174,27 @@ _XFADE_MIN_PREBUFFER_CHUNKS = 4
 # forever and every playback control hung until an app restart.
 _RESOLVE_TIMEOUT_S = 45.0
 
+# How long a caller waits for a resolve another thread already started
+# for the same track (a hover prefetch the click caught mid-flight)
+# before giving up and doing the work itself. Several times a healthy
+# resolve, short enough that a wedged one cannot hold a click hostage:
+# past this the caller resolves on its own, which only costs the
+# duplicate work this was meant to save.
+_RESOLVE_JOIN_S = 4.0
+
+# How long the play path waits for a hover prefetch's init + first
+# segment fetches before pulling them itself. Those fetches take about
+# a second from cold; a click that joins one late waits the remainder,
+# which still beats a second, competing download.
+_WARM_BYTES_JOIN_S = 3.0
+
+# How much of a single-URL (progressive AAC) source a warm fetches.
+# Enough for the MP4 header plus ~25 s of 320 kbps audio; SegmentReader
+# streams the remainder when the track is actually played. Downloads
+# the whole file for every hovered track would pull tens of MB on an
+# album-mount warm and compete with the audio callback.
+_WARM_HEAD_BYTES = 1024 * 1024
+
 # While DLNA is casting a bounded per-track file, the local decoder waits
 # this long for that file's whole-track demux to land on disk before it
 # opens it. Bounded by the same transport budget as a resolve; the file
@@ -168,6 +208,13 @@ _CAST_FILE_READY_S = 60.0
 # is bounded on its own and legitimately exceeds this window for long,
 # hi-res tracks.
 _LOAD_STALL_S = 30.0
+
+# Every stream hand-off in this module goes through pa_guard: closing an
+# OutputStream is not atomic and terminating PortAudio invalidates live
+# streams, both of which crashed the backend inside libportaudio when
+# the finished callback and device recovery raced each other (see
+# pa_guard's docstring).
+_close_pa_stream = pa_guard.close_stream
 
 
 @dataclass
@@ -190,6 +237,29 @@ class StreamInfo:
     track_peak: Optional[float] = None
     album_replay_gain_db: Optional[float] = None
     album_peak: Optional[float] = None
+
+
+_LOSSLESS_REQUEST_TIERS = frozenset({"high_lossless", "hi_res_lossless"})
+
+
+def _cached_tier_is_usable(
+    quality: Optional[str], info: Optional[StreamInfo]
+) -> bool:
+    """Whether a cache entry may satisfy this quality request.
+
+    TIDAL used to answer AAC for every lossless tier (see
+    `app.tidal_client._flac_fallback`), and those wrong-tier tracks are
+    still in the manifest cache and in the disk cache under their
+    lossless keys. Replaying one would pin the badge — and the audio —
+    to Low forever, so a lossy entry is treated as a miss and the
+    track is re-resolved through the FLAC path.
+    """
+    if not quality or quality not in _LOSSLESS_REQUEST_TIERS or info is None:
+        return True
+    raw = getattr(info, "audio_quality", None)
+    if raw is None:
+        return True
+    return str(getattr(raw, "value", raw)).upper() not in ("LOW", "HIGH")
 
 
 @dataclass
@@ -238,10 +308,36 @@ class PlayerSnapshot:
     error: Optional[str] = None
     seq: int = 0
     stream_info: Optional[StreamInfo] = None
+    # How Dolby content is actually reaching the listener: "atmos" when
+    # the JOC objects were decoded and placed by a Dolby Atmos spatial
+    # renderer, "dolby_audio" when only the 5.1/7.1 bed is audible,
+    # None for non-Dolby content. Computed per snapshot (not stored on
+    # StreamInfo) because a Spatial Sound change mid-track changes it.
+    immersive: Optional[str] = None
     # Force Volume: when true the volume slider in the UI should
     # render disabled (value pinned at 100) because the backend
     # rejects changes while it's on.
     force_volume: bool = False
+    # Why playback stopped, when that matters to the UI. "backoff" means
+    # Tidal's request gate is closed, so the failure says nothing about
+    # this track: the queue must not skip ahead, or it walks every
+    # remaining track into the same wall and lengthens the strike.
+    # None for ordinary errors, which are track-specific and skippable.
+    error_kind: Optional[str] = None
+
+
+def _tidal_backoff_active() -> bool:
+    """Whether the Tidal request gate is closed right now.
+
+    Imported inside the function because player.py deliberately doesn't
+    pull in the Tidal client at module scope (its request gate installs
+    itself on the session at import time)."""
+    try:
+        from app.tidal_client import tidal_backoff_state
+
+        return bool(tidal_backoff_state()["active"])
+    except Exception:
+        return False
 
 
 def _looks_like_auth_error(exc: BaseException) -> bool:
@@ -259,6 +355,48 @@ def _looks_like_auth_error(exc: BaseException) -> bool:
     return "401" in msg or "Unauthorized" in msg
 
 
+def _resolve_surround_channels(
+    source_channels: int,
+    device_max_channels: Optional[int],
+    *,
+    windows: bool,
+    exclusive: bool,
+) -> int:
+    """How many channels to feed the output stream for a surround source.
+
+    Windows Spatial Sound (Sonic / Dolby Atmos for Headphones) is a
+    shared-mode APO that virtualises the endpoint's bed. It needs the
+    full bed to place objects: a 5.1 Atmos core padded up to the
+    endpoint's advertised 7.1 gives the virtualiser eight channels to
+    work with, and the OS does the headphone downmix plus binaural
+    rendering. Feeding it 5.1 (or stereo) just plays the three front
+    channels and skips the spatial stage.
+
+    Exclusive mode bypasses the APO chain (bit-perfect output), so it
+    never pads and only downmixes when the device genuinely can't take
+    the source layout. A device that reports stereo has spatial off or
+    isn't a spatial endpoint; padding can't help there, so that case
+    falls through to the existing downmix.
+
+    Returns the channel count to request from the decoder/stream.
+    """
+    if device_max_channels is None:
+        return source_channels
+    if device_max_channels < source_channels:
+        # Shared backends report the OS mixer config; when it is below
+        # the source we must downmix or the open fails.
+        return device_max_channels if device_max_channels >= 6 else 2
+    if (
+        windows
+        and not exclusive
+        and source_channels >= 6
+        and device_max_channels in (6, 8)
+        and device_max_channels > source_channels
+    ):
+        return device_max_channels
+    return source_channels
+
+
 class PCMPlayer:
     def __init__(
         self,
@@ -266,6 +404,8 @@ class PCMPlayer:
         local_lookup: Optional[Callable[[str], Optional[str]]] = None,
         quality_clamp: Optional[Callable[[str], Optional[str]]] = None,
         force_refresh: Optional[Callable[[], bool]] = None,
+        native_atmos_enabled: Optional[Callable[[], bool]] = None,
+        native_atmos_dash: Optional[Callable[[], bool]] = None,
     ):
         self._session_getter = session_getter
         self._local_lookup = local_lookup
@@ -276,6 +416,18 @@ class PCMPlayer:
         # surfaces a clear "log in again"). Injected by the server
         # the same way session_getter is; None in tests/standalone.
         self._force_refresh = force_refresh
+        # Local Atmos files can be handed to Windows' own pipeline
+        # (Dolby decoder MFT + spatial renderer) instead of PyAV,
+        # which only renders the core bed. The predicate is injected
+        # so the player doesn't import settings; None = always off,
+        # which is what standalone/test constructions want.
+        self._native_atmos_enabled = native_atmos_enabled
+        # When on, a streamed Atmos track is handed to MediaPlayer as a
+        # DASH presentation served over loopback while it downloads, so
+        # playback starts on the first segment instead of waiting for
+        # the whole 20-30 MB asset (see atmos_dash.py). A stream the
+        # helper refuses falls back to the finished file.
+        self._native_atmos_dash = native_atmos_dash
 
         self._lock = threading.RLock()
         # Serializes load/stop/seek/preload so concurrent HTTP calls
@@ -358,6 +510,11 @@ class PCMPlayer:
         # `state="ended"` or trigger device-loss recovery against
         # a perfectly healthy device.
         self._replacing_stream: bool = False
+        # Rate limit for the watchdog's dead-stream recovery. A Windows
+        # Spatial Sound change can kill the stream without PortAudio
+        # ever calling finished_callback, which would otherwise leave
+        # the player reporting "playing" with silence forever.
+        self._last_watchdog_recover_t: float = 0.0
 
         # Remembered source for restart-based seek. For DASH streams
         # we store the full URL list (index 0 = init segment, 1+ =
@@ -373,6 +530,84 @@ class PCMPlayer:
         # track matches.
         self._stream_sd_dtype: Optional[str] = None
         self._stream_channels: Optional[int] = None
+        # What the last successful output-stream open actually
+        # negotiated (device index, host API, channel counts). The
+        # Signal Path panel shows the live values; this record keeps
+        # them after the stream closes so the Atmos tester can report
+        # what the PCM engine did with a file.
+        self._last_open_diag: Optional[dict] = None
+
+        # Native Atmos pipeline. `_native` is non-None while the
+        # current track is playing through Windows' MediaPlayer
+        # instead of PyAV. The helper is kept alive between tracks
+        # (MediaPlayer reopens its source) and torn down on the same
+        # calls that close the PCM path.
+        self._native: Optional[NativeAtmosPlayer] = None
+        self._native_info: Optional[StreamInfo] = None
+        self._native_duration_ms: int = 0
+        self._native_pos_ms: int = 0
+        self._native_pos_at: float = 0.0
+        self._native_playback_state: Optional[str] = None
+        self._native_decoders: list[str] = []
+        self._native_device: str = ""
+        # Spatial Sound state of the render endpoint, as reported by the
+        # helper: the active spatial format slug ("" = spatial off) and
+        # whether the endpoint supports spatial audio at all. Refreshed
+        # on every helper poll so flipping Spatial Sound mid-track moves
+        # the now-playing badge instead of waiting for the next track.
+        self._native_spatial_format: str = ""
+        self._native_spatial_supported: bool = False
+        self._native_monitor: Optional[threading.Thread] = None
+        self._native_monitor_stop: Optional[threading.Event] = None
+        # Loudness normalization for the native path. MediaPlayer has
+        # no software DSP stage, so the offset rides on its volume
+        # knob (see winrt_player.ps1). `_native_gain_source` records
+        # where the number came from: "tags" (local ReplayGain tags),
+        # "measured" (EBU R128 scan of the file), "pending" (scan
+        # still running), or "off".
+        self._native_gain_db: float = 0.0
+        self._native_gain_applied_db: float = 0.0
+        self._native_gain_source: str = "off"
+        self._native_loudness_lufs: Optional[float] = None
+        self._native_gain_lock = threading.Lock()
+
+        # Streamed Atmos tracks, buffered as one local file per track so
+        # the native pipeline can open them (see _stream_atmos_candidate).
+        # The files live in user_data_dir and outlast the process, so a
+        # replay (or the next app launch) skips the download; the
+        # in-memory records are just the fast lookup for them.
+        # `_native_stream_failures` holds the retry-after time for tracks
+        # whose buffer didn't finish, so a slow asset isn't re-downloaded
+        # on every click.
+        self._native_stream_files: dict[str, _BufferedAtmos] = {}
+        self._native_stream_failures: dict[str, float] = {}
+        self._native_stream_lock = threading.Lock()
+        self._native_stream_dir: Optional[str] = None
+        self._atmos_cache_swept = False
+        # The streamed Atmos track currently being served to MediaPlayer
+        # as DASH while it downloads (see _start_dash_atmos), and the
+        # look-ahead download preload() published for the queue's next
+        # track, which a click adopts as-is (see _preload_atmos_stream).
+        self._dash_atmos: Optional[_DashAtmos] = None
+        self._dash_preloads: dict[str, _DashAtmos] = {}
+        self._dash_lock = threading.Lock()
+        # A spawn-idle helper holding the preloaded track's source,
+        # opened paused and silent. The look-ahead pays the helper
+        # spawn and the first open; the click only sets the level and
+        # presses play. See _warm_native_helper.
+        self._native_warm: Optional[NativeAtmosPlayer] = None
+        self._native_warm_url: Optional[str] = None
+        self._native_warm_reply: dict = {}
+        self._native_warm_at = 0.0
+        self._native_warm_lock = threading.Lock()
+        # Bumped by every load()/play_track() click so an in-progress
+        # buffer can abandon the download the moment the user picks
+        # something else.
+        self._load_seq = 0
+        # The track the newest load() is for. Paired with `_load_seq`
+        # to tell "a newer click is queued" apart from "this same
+        # track was requested again" (double click, restore).
+        self._load_target_id: Optional[str] = None
 
         # Preloaded next track. Populated by `preload()` ~15s before
         # the current track ends; consumed in-place by the audio
@@ -397,6 +632,21 @@ class PCMPlayer:
         # and, if bytes are warmed, of the init + first-media
         # segment fetches too. See app/audio/manifest_cache.py.
         self._manifest_cache = ManifestCache()
+        # Finished streamed tracks, on disk. The bytes the decoder
+        # already fetched are teed here, and a later play of the same
+        # (track, quality) opens the file instead of re-downloading.
+        # See app/audio/stream_cache.py.
+        self._pcm_stream_cache = StreamCache()
+        # One resolve per (track, quality) at a time. A hover prefetch
+        # and the click it is warming overlap by design; without this
+        # map they race, both issuing the same Tidal calls.
+        self._resolving: dict[tuple, "_ResolveTicket"] = {}
+        self._resolving_lock = threading.Lock()
+        # Init + first-segment downloads started by a hover prefetch,
+        # so the play that follows can take them instead of racing a
+        # second copy. See _warm_bytes / _adopt_warm_bytes.
+        self._warm_inflight: dict[tuple, dict[int, object]] = {}
+        self._warm_lock = threading.Lock()
 
         # 10-band biquad EQ applied in the audio callback. One
         # instance owned for the lifetime of the player; when the
@@ -446,6 +696,14 @@ class PCMPlayer:
         self._replaygain_mode: ReplayGainMode = "off"
         self._replaygain_preamp_db: float = 0.0
         self._replaygain_prevent_clipping: bool = True
+        # Where the PCM path's gain came from, for `replaygain_state()`
+        # and the signal-path panel. Streams carry TIDAL's tags; a
+        # downloaded file carries none, so it is measured locally.
+        self._pcm_gain_source: str = "none"
+        self._pcm_gain_db: float = 0.0
+        self._pcm_loudness_lufs: Optional[float] = None
+        self._loudness_scan_path: Optional[str] = None
+        self._loudness_scan_lock = threading.Lock()
         # Crossfade duration in seconds for automatic track-to-track
         # transitions (0 = off). The audio callback drives the actual
         # fade once a track nears its end and a compatible preload is
@@ -647,18 +905,48 @@ class PCMPlayer:
         self, track_id: str, quality: Optional[str] = None
     ) -> PlayerSnapshot:
         """Resolve stream/local source, open decoder + output stream.
-        Doesn't start playback; caller must `play()` next.
+        Doesn't start playback; caller must `play()` next. The native
+        Atmos branch obeys this too — it opens MediaPlayer paused, so
+        the launch restore never makes a sound on its own.
 
         Serialized on `_pipeline_lock`: concurrent HTTP calls (rapid
         skip, backend auto-swap colliding with frontend play_track,
         etc.) resolve in order rather than racing into overlapping
         sounddevice streams.
         """
+        with self._lock:
+            # Claim this load before queueing for the pipeline. Buffering
+            # a streamed Atmos track can hold the lock for a while, and a
+            # newer click must be able to cut that short. getattr because
+            # some unit tests build the player via __new__.
+            self._load_seq = getattr(self, "_load_seq", 0) + 1
+            self._load_target_id = track_id
+            load_seq = self._load_seq
         with self._pipeline_lock:
-            return self._load_locked(track_id, quality)
+            return self._load_locked(track_id, quality, load_seq)
+
+    def _load_superseded(
+        self, load_seq: Optional[int], track_id: str
+    ) -> bool:
+        """True when a newer load for a *different* track is queued.
+
+        `load()` (and `play_track()`, which is the load a Next press
+        actually sends) bumps `_load_seq` the moment a click arrives,
+        before it waits for `_pipeline_lock`. A load still running at
+        that point is dead on arrival: letting it open its source and
+        call play is what made rapid Next presses audibly start each
+        intermediate track. A newer load for the same track (double
+        click, restore) does not supersede — it is the same work.
+        """
+        if load_seq is None:
+            return False
+        with self._lock:
+            newer = self._load_seq
+            target = self._load_target_id
+        return newer != load_seq and target != track_id
 
     def _load_locked(
-        self, track_id: str, quality: Optional[str]
+        self, track_id: str, quality: Optional[str], load_seq: Optional[int] = None
     ) -> PlayerSnapshot:
         self._dbg(
             f"load track={track_id} quality={quality} "
@@ -666,6 +954,36 @@ class PCMPlayer:
             f"current_state={self._state} "
             f"preload={self._preload.track_id if self._preload else 'None'}"
         )
+        if self._load_superseded(load_seq, track_id):
+            # A newer click is already waiting for the pipeline lock.
+            # Open nothing and touch nothing: the track that is
+            # playing keeps playing until that newer load replaces it,
+            # instead of this one flashing its audio first.
+            self._dbg(f"load: superseded by a newer click; skipping {track_id}")
+            return self.snapshot()
+        # A look-ahead download for some other track is dead weight
+        # now; one for *this* track is kept, and
+        # _stream_atmos_candidate adopts it instead of downloading again.
+        self._retire_dash_preloads(keep=track_id)
+        # Native Atmos path: hand Atmos audio to Windows' own pipeline.
+        # Local Atmos files go straight through; a streamed Atmos track
+        # is buffered to one local file first, because MediaPlayer opens
+        # files and TIDAL only serves segments. Checked before the
+        # preload/gapless branches because a PCM preload of an Atmos
+        # track would otherwise win (it decodes the same audio through
+        # PyAV and skips the objects).
+        candidate = self._native_candidate(
+            track_id, quality, allow_stream=True, load_seq=load_seq
+        )
+        if candidate is not None:
+            if self._load_superseded(load_seq, track_id):
+                self._dbg(
+                    f"load: superseded during native resolve; skipping {track_id}"
+                )
+                return self.snapshot()
+            native_snap = self._try_load_native(track_id, *candidate)
+            if native_snap is not None:
+                return native_snap
         with self._lock:
             # Path 0: already audible on this track. Happens when
             # the callback's gapless swap already transitioned us
@@ -710,11 +1028,20 @@ class PCMPlayer:
             # which is the whole point of the preload. This is the
             # path that keeps auto-advance gapless when the frontend
             # races the callback's swap.
+            #
+            # Requires an open OutputStream. A native Atmos track
+            # plays on the OS pipeline with no sounddevice stream, so
+            # adopting a preload there fed a queue nothing drained
+            # while the helper kept playing the previous track — right
+            # after an Atmos track, the next (ordinary) track went
+            # silent. Those loads fall through to the teardown below,
+            # which closes the helper first.
             pre = self._preload
             if (
                 pre is not None
                 and pre.track_id == track_id
                 and (quality is None or pre.quality == quality)
+                and self._stream is not None
                 and self._state in ("playing", "paused", "loading")
             ):
                 self._dbg(
@@ -785,6 +1112,17 @@ class PCMPlayer:
                 and synthetic.sd_dtype == active_dtype
                 and synthetic.channels == active_channels
             )
+            if self._load_superseded(load_seq, track_id):
+                # The build took long enough for a newer click to be
+                # queued. Discard the pipeline: swapping it in here
+                # would make this intermediate track audible for the
+                # fraction of a second before the newer load wins.
+                self._dbg(
+                    f"load: superseded during pipeline build; "
+                    f"skipping {track_id}"
+                )
+                self._discard_pipeline(synthetic)
+                return self.snapshot()
             # Path (A): adopt the pipeline we just built. When its
             # format matches the open stream, the stream stays open
             # across the swap. When it doesn't (usually a 16-bit track
@@ -889,7 +1227,13 @@ class PCMPlayer:
 
         # Path (B): no active stream. Full teardown + fresh open at the
         # new decoder's native rate.
-        self._teardown()
+        if self._load_superseded(load_seq, track_id):
+            self._dbg(f"load: superseded before teardown; skipping {track_id}")
+            return self.snapshot()
+        # This is the Atmos -> PCM leg of a mixed queue. Park the native
+        # helper rather than closing it: the Atmos track after this one
+        # then only opens a source in it, instead of paying the spawn.
+        self._teardown(park_native=True)
         t_teardown = time.monotonic()
         with self._lock:
             self._transition("loading", track_id=track_id)
@@ -922,15 +1266,61 @@ class PCMPlayer:
                         flush=True,
                     )
 
-            initial_source = self._open_stream_source(
-                source_spec, prefetched_bytes
+            cache_sink = self._pcm_stream_cache_sink(
+                track_id,
+                quality,
+                source_spec,
+                duration_s,
+                stream_info,
+                track_meta,
             )
-            decoder = Decoder(initial_source)
+            initial_source = self._open_stream_source(
+                source_spec, prefetched_bytes, sink=cache_sink
+            )
+            decoder = Decoder(
+                initial_source, surround=_is_atmos_stream_info(stream_info)
+            )
             t_decoder = time.monotonic()
+            if self._load_superseded(load_seq, track_id):
+                # Resolving took long enough for a newer click to be
+                # queued. Close this source instead of opening an
+                # output stream for a track that would play for a
+                # few hundred milliseconds at most.
+                self._dbg(
+                    f"load: superseded after resolve; skipping {track_id}"
+                )
+                try:
+                    decoder.cancel_source()
+                except Exception:
+                    pass
+                try:
+                    decoder.close()
+                except Exception:
+                    pass
+                return self.snapshot()
         except Exception as exc:
-            log.exception("failed to resolve/open source for %s", track_id)
+            # A backoff window is an expected refusal, not a bug: every
+            # track click during the 60 s after a Tidal 429 lands here,
+            # and a full traceback per attempt buries the log without
+            # saying anything the banner doesn't. One line, plus a
+            # message the now-playing bar can actually show.
+            from app.tidal_client import TidalBackoffError
+
+            if isinstance(exc, TidalBackoffError):
+                log.warning(
+                    "playback blocked for %s: Tidal backoff, %ss left",
+                    track_id,
+                    f"{exc.seconds_remaining:.0f}",
+                )
+                message = (
+                    "TIDAL is rate-limiting requests — try again in "
+                    f"{int(exc.seconds_remaining) + 1}s"
+                )
+            else:
+                log.exception("failed to resolve/open source for %s", track_id)
+                message = str(exc)
             with self._lock:
-                self._last_error = str(exc)
+                self._last_error = message
                 self._transition("error")
             self._emit()
             return self.snapshot()
@@ -1015,6 +1405,1797 @@ class PCMPlayer:
         self._emit()
         return self.snapshot()
 
+    # --- native Atmos pipeline --------------------------------------
+
+    def _native_candidate(
+        self,
+        track_id: str,
+        quality: Optional[str] = None,
+        *,
+        allow_stream: bool = False,
+        load_seq: Optional[int] = None,
+    ) -> Optional[tuple[str, Optional[float], StreamInfo]]:
+        """Return `(path, duration_s, info)` when this track should
+        play through the Windows pipeline.
+
+        Only Dolby Atmos content qualifies — the native path exists to
+        render the JOC object layer PyAV drops, and it sacrifices EQ /
+        crossfeed / gapless, which are still worth having for ordinary
+        multichannel files (5.1 FLAC etc.) that the PCM engine handles
+        fine. Loudness leveling is the exception: it does run there, as
+        a gain on MediaPlayer's volume stage, because a quiet immersive
+        render is exactly as annoying as a quiet stereo one.
+
+        `allow_stream` additionally buffers a TIDAL Atmos asset when no
+        local file exists. It stays off on the speculative paths: a
+        hover prefetch must not pull tens of MB on a guess. `preload()`
+        is the exception — the next queue track is a real prediction,
+        so it runs the download itself while the current track plays
+        (see `_preload_atmos_stream`).
+        """
+        local = self._native_local_candidate(track_id)
+        if local is not None:
+            return local
+        if not allow_stream:
+            return None
+        return self._stream_atmos_candidate(track_id, quality, load_seq)
+
+    def _native_available(self) -> bool:
+        """Whether the native pipeline may be used at all right now."""
+        if self._native_atmos_enabled is None:
+            return False
+        try:
+            if not self._native_atmos_enabled():
+                return False
+        except Exception:
+            return False
+        if self._external_output_active:
+            # Cast / DLNA owns the audio; the native helper can't be
+            # silenced the way the PCM stream can, so never start it
+            # behind a remote output session.
+            return False
+        return native_atmos.supported()
+
+    def _native_local_candidate(
+        self, track_id: str
+    ) -> Optional[tuple[str, Optional[float], StreamInfo]]:
+        if not self._local_lookup:
+            return None
+        path = self._local_lookup(track_id)
+        if not path or not os.path.exists(path):
+            return None
+        if os.path.splitext(path)[1].lower() not in _NATIVE_ATMOS_EXTS:
+            return None
+        if not self._native_available():
+            return None
+        if not _local_file_is_atmos(path):
+            return None
+        info, duration_s = _probe_local_stream_info(path)
+        if info is None:
+            return None
+        return path, duration_s, info
+
+    def _stream_atmos_eligible(self, track_id: str, quality: Optional[str]) -> bool:
+        """Whether this track would be buffered for the native pipeline.
+
+        Says nothing about whether TIDAL actually has an Atmos asset —
+        only that the native path is the one this play should take.
+        """
+        if (quality or "").lower() != "atmos":
+            return False
+        if not self._native_available():
+            return False
+        if self._local_lookup is not None:
+            try:
+                if self._local_lookup(track_id):
+                    # A local file wins; _native_local_candidate has
+                    # already decided what to do with it.
+                    return False
+            except Exception:
+                pass
+        return True
+
+    def _stream_atmos_candidate(
+        self, track_id: str, quality: Optional[str], load_seq: Optional[int]
+    ) -> Optional[tuple[str, Optional[float], StreamInfo]]:
+        """Buffer a TIDAL Dolby Atmos stream so the native pipeline can
+        play it.
+
+        The Atmos asset only exists as a DASH segment list, so the
+        segments are published to MediaPlayer one at a time and the same
+        bytes are joined into one file under the cache dir as they
+        arrive — the next play of that track opens the file directly.
+        Returns None whenever the track isn't a streamed Atmos release
+        or the stream isn't ready in time — the caller then falls
+        through to the PCM engine, which decodes the same asset's
+        5.1/7.1 bed exactly as before.
+        """
+        if not self._stream_atmos_eligible(track_id, quality):
+            return None
+        cached = self._native_stream_hit(track_id)
+        if cached is not None:
+            return cached.path, cached.duration_s, cached.info
+        preload = self._dash_preload_for(track_id)
+        if preload is not None:
+            if preload.done_failed:
+                self._retire_dash_atmos(preload)
+            else:
+                # preload() published this track while an earlier one
+                # was playing; that head start is the whole point. The
+                # click costs nothing now: MediaPlayer opens the
+                # manifest and most of the segments it asks for are
+                # already on disk.
+                return self._adopt_dash_preload(preload)
+        if self._native_stream_backoff(track_id):
+            return None
+        try:
+            # set_current_meta stays False: the metadata is read by the
+            # renderer's SetAVTransportURI, and this path only ever runs
+            # with no cast session active.
+            spec, duration_s, info, prefetched, _meta = self._resolve_source(
+                track_id, "atmos", set_current_meta=False
+            )
+        except Exception as exc:
+            log.debug("atmos stream resolve failed for %s: %s", track_id, exc)
+            self._native_stream_failed(track_id)
+            return None
+        if not isinstance(spec, list) or not _is_atmos_stream_info(info):
+            if isinstance(spec, list):
+                # No Atmos asset: _resolve_source already fell back to
+                # the best lossless tier. Alias that answer under the
+                # "atmos" key so the PCM path right behind us — which
+                # asks for "atmos" again — serves it from cache instead
+                # of walking the Atmos lookup a second time on every
+                # play of a non-Atmos track.
+                self._manifest_cache.store(
+                    (track_id, "atmos"), list(spec), duration_s, info, _meta
+                )
+            return None
+        if self._dash_atmos_enabled():
+            # A hover prefetch may be fetching these very segments;
+            # take its bytes rather than downloading them again.
+            prefetched = self._adopt_warm_bytes(
+                (track_id, "atmos"), prefetched
+            )
+            session = self._start_dash_atmos(
+                track_id, spec, prefetched, duration_s, info, load_seq
+            )
+            if session is not None:
+                # The caller hands this manifest URL to the helper; the
+                # download keeps running behind it and publishes the
+                # joined file to the cache, so the next play is a plain
+                # open.
+                return session.url, duration_s, info
+            cached = self._native_stream_hit(track_id)
+            if cached is not None:
+                # The first segment did not arrive in time but the
+                # download did finish, so the file is still worth
+                # opening.
+                return cached.path, cached.duration_s, cached.info
+        path = self._buffer_atmos_segments(track_id, spec, prefetched, load_seq)
+        if path is None:
+            if load_seq is not None and self._load_seq != load_seq:
+                # A newer click abandoned this download. That is not a
+                # failure: a backoff here would send the track to the
+                # PCM engine for the next minute if the user comes
+                # back to it.
+                return None
+            self._native_stream_failed(track_id)
+            return None
+        self._native_stream_store(track_id, path, duration_s, info)
+        return path, duration_s, info
+
+    # --- buffered stream cache --------------------------------------
+
+    def _native_stream_hit(self, track_id: str) -> Optional[_BufferedAtmos]:
+        now = time.monotonic()
+        with self._native_stream_lock:
+            entry = self._native_stream_files.get(track_id)
+            if entry is not None:
+                if not os.path.exists(entry.path):
+                    self._native_stream_files.pop(track_id, None)
+                elif entry.expires_at > now:
+                    return entry
+                elif entry.path == self._source_path:
+                    # Still audible through the native pipeline. Extend
+                    # rather than let it expire: a replay of this track
+                    # has to reuse the file, since MediaPlayer holds it
+                    # open and writing a replacement would fail.
+                    entry.expires_at = now + _NATIVE_STREAM_TTL_S
+                    return entry
+                else:
+                    # Past its TTL. The file is what is worth keeping,
+                    # so re-adopt it from disk rather than re-download:
+                    # the sidecar still has the stream's metadata.
+                    self._native_stream_files.pop(track_id, None)
+        return self._adopt_cached_atmos_file(track_id)
+
+    def _adopt_cached_atmos_file(self, track_id: str) -> Optional[_BufferedAtmos]:
+        """Pick up a buffered file written earlier — by a previous
+        instance of the app, or by this one before its record aged out.
+
+        Only the sidecar is trusted for metadata; the file is trusted
+        because its recorded size matches. Anything else (no sidecar,
+        size mismatch, unreadable JSON) means there is no cache to
+        adopt, and the caller downloads the track as usual.
+        """
+        path = self._atmos_cache_path(track_id)
+        payload = _read_atmos_sidecar(path)
+        if payload is None:
+            return None
+        try:
+            info = StreamInfo(**payload["info"])
+        except TypeError:
+            # Written by a build whose StreamInfo had different fields.
+            return None
+        duration_s = payload.get("duration_s")
+        entry = _BufferedAtmos(
+            path=path,
+            duration_s=(
+                float(duration_s) if isinstance(duration_s, (int, float)) else None
+            ),
+            info=info,
+            expires_at=time.monotonic() + _NATIVE_STREAM_TTL_S,
+        )
+        with self._native_stream_lock:
+            self._native_stream_files[track_id] = entry
+        log.info("atmos cache: reusing buffered track %s", track_id)
+        return entry
+
+    def _native_stream_backoff(self, track_id: str) -> bool:
+        with self._native_stream_lock:
+            until = self._native_stream_failures.get(track_id)
+            if until is None:
+                return False
+            if until > time.monotonic():
+                return True
+            self._native_stream_failures.pop(track_id, None)
+            return False
+
+    def _native_stream_failed(self, track_id: str) -> None:
+        with self._native_stream_lock:
+            self._native_stream_failures[track_id] = (
+                time.monotonic() + _NATIVE_STREAM_FAILURE_TTL_S
+            )
+
+    def _native_stream_store(
+        self,
+        track_id: str,
+        path: str,
+        duration_s: Optional[float],
+        info: StreamInfo,
+    ) -> None:
+        _write_atmos_sidecar(path, duration_s, info)
+        with self._native_stream_lock:
+            self._native_stream_failures.pop(track_id, None)
+            self._native_stream_files[track_id] = _BufferedAtmos(
+                path=path,
+                duration_s=duration_s,
+                info=info,
+                expires_at=time.monotonic() + _NATIVE_STREAM_TTL_S,
+            )
+        self._native_stream_prune()
+
+    def _native_stream_prune(self) -> None:
+        """Forget records whose file is gone, then hold the disk budget.
+
+        Expiry no longer deletes anything: the file is the expensive
+        part, it is still valid, and `_native_stream_hit` re-adopts it
+        from its sidecar. What gets deleted is decided by age and total
+        size in `_prune_atmos_cache_files` — and never the file the
+        native pipeline has open.
+        """
+        with self._native_stream_lock:
+            for tid, entry in list(self._native_stream_files.items()):
+                if not os.path.exists(entry.path):
+                    self._native_stream_files.pop(tid, None)
+        self._prune_atmos_cache_files()
+
+    def _prune_atmos_cache_files(self) -> None:
+        """Delete buffered tracks over the age/size budget, oldest first."""
+        directory = self._atmos_stream_dir()
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return
+        audible = self._source_path
+        now = time.time()
+        files: list[tuple[float, str, int]] = []
+        for name in names:
+            if not name.endswith(".m4a"):
+                continue
+            path = os.path.join(directory, name)
+            if path == audible:
+                # Open in MediaPlayer for the track that's audible;
+                # removing it would fail and the bytes are in use.
+                continue
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if now - st.st_mtime > _NATIVE_STREAM_DISK_MAX_AGE_S:
+                _remove_atmos_cache_file(path)
+                continue
+            files.append((st.st_mtime, path, st.st_size))
+        total = sum(size for _mtime, _path, size in files)
+        if total <= _NATIVE_STREAM_DISK_MAX_BYTES:
+            return
+        for _mtime, path, size in sorted(files):
+            if total <= _NATIVE_STREAM_DISK_MAX_BYTES:
+                break
+            _remove_atmos_cache_file(path)
+            total -= size
+            with self._native_stream_lock:
+                stale = [
+                    tid
+                    for tid, entry in self._native_stream_files.items()
+                    if entry.path == path
+                ]
+                for tid in stale:
+                    self._native_stream_files.pop(tid, None)
+
+    def _atmos_cache_path(self, track_id: str) -> str:
+        # track_id comes from the request body, so it is not a path
+        # component: keep the name a plain file name in the cache dir.
+        safe = "".join(
+            ch if ch.isalnum() or ch in "-_" else "_" for ch in str(track_id)
+        )[:64] or "track"
+        return os.path.join(self._atmos_stream_dir(), f"{safe}.m4a")
+
+    def _atmos_stream_dir(self) -> str:
+        pending_sweep = False
+        with self._native_stream_lock:
+            if self._native_stream_dir is None:
+                self._native_stream_dir = str(
+                    user_data_dir() / _NATIVE_STREAM_CACHE_DIR
+                )
+                pending_sweep = not self._atmos_cache_swept
+                self._atmos_cache_swept = True
+            resolved = self._native_stream_dir
+        # The cache dir is a cache: it can be deleted at any point
+        # while the process is up. Recreate it on every use instead of
+        # trusting the path resolved at startup, so a delete costs a
+        # re-download rather than a permanently broken track.
+        try:
+            os.makedirs(resolved, exist_ok=True)
+        except OSError:
+            # Unwritable cache root: callers fall back to streaming.
+            pass
+        if pending_sweep:
+            self._sweep_atmos_cache(resolved)
+            threading.Thread(
+                target=_sweep_legacy_atmos_dirs,
+                name="atmos-cache-sweep",
+                daemon=True,
+            ).start()
+        return resolved
+
+    def _sweep_atmos_cache(self, directory: str) -> None:
+        """Clean up after previous runs: half-written buffers, orphaned
+        sidecars, and files past the age budget."""
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            names = []
+        now = time.time()
+        for name in names:
+            path = os.path.join(directory, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if name.startswith("dash-") and os.path.isdir(path):
+                # A DASH publication outlives its writer only while
+                # MediaPlayer still reads it; one this old was left by
+                # a process that died, or a delete that kept hitting
+                # the open source.
+                if (
+                    now - st.st_mtime > 3600
+                    and not dash_server.is_published_directory(path)
+                ):
+                    shutil.rmtree(path, ignore_errors=True)
+            elif name.endswith(".json.part"):
+                # Sidecar writes are instant; a leftover is debris.
+                _remove_atmos_cache_file(path)
+            elif name.endswith(".part"):
+                # A live download keeps rewriting its part file; one
+                # this old was abandoned by a process that died.
+                if now - st.st_mtime > 3600:
+                    _remove_atmos_cache_file(path)
+            elif name.endswith(".json") and not os.path.exists(path[:-5]):
+                _remove_atmos_cache_file(path[:-5])
+            elif name.endswith(".m4a") and not os.path.exists(f"{path}.json"):
+                # A complete buffer always gets its sidecar. One
+                # without could be a write that died before finishing
+                # (those cannot be deleted live — MediaPlayer holds the
+                # files), so give it an hour for any writer this
+                # process still has, then retire it.
+                if now - st.st_mtime > 3600:
+                    _remove_atmos_cache_file(path)
+        self._prune_atmos_cache_files()
+
+    def _buffer_atmos_segments(
+        self,
+        track_id: str,
+        urls: list[str],
+        prefetched: Optional[dict[int, bytes]],
+        load_seq: Optional[int],
+    ) -> Optional[str]:
+        """Concatenate the DASH segments into one fragmented MP4.
+
+        fMP4 is what a downloaded Atmos track is, and that exact file
+        shape already plays through the native pipeline, so joining the
+        segments reproduces it. Written to `.part` and renamed on
+        success: a half file must never reach MediaPlayer.
+
+        One connection is opened ahead of the body being streamed —
+        the same overlap the downloader uses, and deliberately no more
+        (several parallel requests per track is the concurrent-stream
+        pattern TIDAL's anti-abuse layer watches). The deadline and the
+        load sequence are both checked between chunks so a stalled
+        download can neither pin the pipeline lock against a newer
+        click nor leave the user with no audio when the PCM engine
+        could be playing the bed immediately.
+
+        This is the fallback for a stream that cannot be published as
+        DASH (or a run with streaming turned off), not the normal path:
+        it is the only one that makes the click wait for every segment.
+        """
+        from app.http import SESSION
+
+        # `_atmos_stream_dir` recreates a deleted cache dir and also
+        # serves tests that inject `_native_stream_dir` directly.
+        try:
+            os.makedirs(self._atmos_stream_dir(), exist_ok=True)
+            final = self._atmos_cache_path(track_id)
+        except OSError as exc:
+            log.debug("atmos cache dir unavailable for %s: %s", track_id, exc)
+            return None
+        # Thread-scoped so two writers for the same track (a stream and
+        # a fallback racing on a cancel) can't write into each other's
+        # half file.
+        target = f"{final}.{threading.get_ident()}.part"
+        deadline = time.monotonic() + _NATIVE_STREAM_BUFFER_DEADLINE_S
+        have = prefetched or {}
+        written = 0
+        t0 = time.monotonic()
+
+        def _abandoned() -> bool:
+            if load_seq is not None and self._load_seq != load_seq:
+                return True
+            return time.monotonic() > deadline
+
+        def _open(url: str):
+            return SESSION.get(url, stream=True, timeout=60)
+
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="atmos-buffer")
+        next_resp = None
+        try:
+            with open(target, "wb") as fh:
+
+                idx = 0
+                # Seeds fetched by hover/album prefetch (init + first
+                # media segment) are already in memory.
+                while idx in have and idx < len(urls):
+                    chunk = have[idx]
+                    fh.write(chunk)
+                    written += len(chunk)
+                    idx += 1
+                if idx < len(urls):
+                    next_resp = pool.submit(_open, urls[idx])
+                while idx < len(urls):
+                    if _abandoned():
+                        raise RuntimeError("atmos stream buffer abandoned")
+                    resp = next_resp.result()  # type: ignore[union-attr]
+                    next_resp = (
+                        pool.submit(_open, urls[idx + 1])
+                        if idx + 1 < len(urls)
+                        else None
+                    )
+                    try:
+                        resp.raise_for_status()
+                        for piece in resp.iter_content(chunk_size=65536):
+                            if _abandoned():
+                                raise RuntimeError(
+                                    "atmos stream buffer abandoned"
+                                )
+                            if not piece:
+                                continue
+                            fh.write(piece)
+                            written += len(piece)
+                    finally:
+                        try:
+                            resp.close()
+                        except Exception:
+                            pass
+                    idx += 1
+            os.replace(target, final)
+        except Exception as exc:
+            log.debug("atmos stream buffer failed for %s: %s", track_id, exc)
+            try:
+                os.remove(target)
+            except OSError:
+                pass
+            return None
+        finally:
+            # Never wait on a pending request here: on abandonment it can
+            # still be sitting on its 60s read timeout.
+            pool.shutdown(wait=False, cancel_futures=True)
+        _perf = (
+            f"[perf] atmos stream buffer track={track_id} "
+            f"segments={len(urls)} bytes={written} "
+            f"elapsed={(time.monotonic() - t0) * 1000.0:.0f}ms"
+        )
+        print(_perf, file=sys.stderr, flush=True)
+        audio_log.info(_perf)
+        return final
+
+    # --- streaming Atmos preload ------------------------------------
+
+    def _preload_atmos_stream(
+        self, track_id: str, quality: Optional[str]
+    ) -> dict:
+        """Publish a streamed Atmos track as DASH before it is clicked.
+
+        The queue's next track is known ten seconds into the current
+        one, so its download can be paid for early — the same look-ahead
+        Apple Music and Spotify buy by buffering the next queue item.
+        It is the *same* session the click will own, not a second copy:
+        one writer per track, so the click has nothing to wait for and
+        nothing to duplicate. Pre-resolving here, instead of in the
+        writer thread, keeps Tidal resolution serialized the way
+        ordinary preloads are (the Atmos fallback path briefly flips
+        `session.config.quality`).
+
+        Returns a preload-shaped dict. `native` mirrors `preload()`'s
+        existing contract for Atmos-eligible tracks; `started` / `hit`
+        say whether this call published a track or found one finished.
+        """
+        cached = self._native_stream_hit(track_id)
+        if cached is not None:
+            return {"ok": True, "native": True, "hit": True}
+        if self._dash_for_track(track_id) is not None:
+            # This track is already downloading and published; a second
+            # writer would duplicate the whole asset.
+            return {"ok": True, "native": True, "hit": False}
+        if not self._dash_atmos_enabled():
+            # With streaming off the only pre-staging is a whole-file
+            # download, and the click has to wait for that file either
+            # way — the play path does it itself.
+            return {"ok": True, "native": True, "hit": False}
+        if self._native_stream_backoff(track_id):
+            return {"ok": True, "native": True, "hit": False}
+
+        # One look-ahead download at a time: a preload for a different
+        # track makes the old one pointless, and stacking whole-asset
+        # downloads is the burst pattern TIDAL's gate reads as abuse.
+        self._retire_dash_preloads(keep=track_id)
+        try:
+            with self._pipeline_lock:
+                source_spec, duration_s, info, prefetched, track_meta = (
+                    self._resolve_source(track_id, "atmos", set_current_meta=False)
+                )
+        except Exception as exc:
+            log.debug("atmos preload resolve failed for %s: %s", track_id, exc)
+            return {"ok": True, "native": True, "hit": False}
+        if not isinstance(source_spec, list) or not _is_atmos_stream_info(info):
+            if isinstance(source_spec, list):
+                # Same fallback aliasing _stream_atmos_candidate does:
+                # the release has no Atmos asset, so remember the tier
+                # we did get for the PCM play that follows.
+                self._manifest_cache.store(
+                    (track_id, "atmos"),
+                    list(source_spec),
+                    duration_s,
+                    info,
+                    track_meta,
+                )
+            return {"ok": True, "native": False, "hit": False}
+
+        try:
+            session = self._publish_dash_atmos(
+                track_id,
+                source_spec,
+                prefetched,
+                duration_s,
+                info,
+                preload=True,
+            )
+        except Exception as exc:
+            # Cache dir deleted mid-session or otherwise unwritable: a
+            # look-ahead is best-effort, and the click will retry and
+            # fall back on its own.
+            log.warning(
+                "atmos dash: preload publish failed for %s: %s",
+                track_id,
+                exc,
+            )
+            return {"ok": True, "native": True, "hit": False}
+        self._warm_native_helper(session)
+        return {"ok": True, "native": True, "hit": False, "started": True}
+
+    # --- DASH streaming ---------------------------------------------
+
+    def _dash_atmos_enabled(self) -> bool:
+        # getattr because some unit tests build the player via __new__.
+        enabled = getattr(self, "_native_atmos_dash", None)
+        if enabled is None:
+            return False
+        try:
+            return bool(enabled())
+        except Exception:
+            return False
+
+    def _dash_for_url(self, url: str) -> Optional[_DashAtmos]:
+        with self._dash_lock:
+            session = self._dash_atmos
+        if session is not None and session.url == url:
+            return session
+        return None
+
+    def _dash_for_track(self, track_id: str) -> Optional[_DashAtmos]:
+        with self._dash_lock:
+            session = self._dash_atmos
+            if session is not None and session.track_id == track_id:
+                return session
+            return self._dash_preloads.get(track_id)
+
+    def _dash_preload_for(self, track_id: str) -> Optional[_DashAtmos]:
+        with self._dash_lock:
+            return self._dash_preloads.get(track_id)
+
+    def _take_dash_preload(self, track_id: str) -> Optional[_DashAtmos]:
+        with self._dash_lock:
+            return self._dash_preloads.pop(track_id, None)
+
+    def _dash_dir(self, track_id: str) -> str:
+        safe = "".join(
+            ch if ch.isalnum() or ch in "-_" else "_" for ch in str(track_id)
+        )[:48] or "track"
+        return os.path.join(
+            self._atmos_stream_dir(), f"dash-{safe}-{uuid.uuid4().hex[:8]}"
+        )
+
+    def _publish_dash_atmos(
+        self,
+        track_id: str,
+        urls: list[str],
+        prefetched: Optional[dict[int, bytes]],
+        duration_s: Optional[float],
+        info: StreamInfo,
+        *,
+        preload: bool,
+    ) -> _DashAtmos:
+        """Publish a track as DASH and start writing its segments.
+
+        `preload` distinguishes a look-ahead download from one a click
+        is waiting on: a look-ahead goes in the preload slot, where a
+        click can adopt it, and never retires the track that is playing
+        right now.
+        """
+        directory = self._dash_dir(track_id)
+        # os.makedirs creates intermediate directories, so this also
+        # recovers a cache dir removed while the app was running.
+        os.makedirs(directory, exist_ok=True)
+        url, publication = dash_server.publish(
+            track_id,
+            directory,
+            max(0, len(urls) - 1),
+            duration_s=duration_s,
+            bandwidth=_DASH_BANDWIDTH_BPS,
+        )
+        publication.fetch = lambda index: self._fetch_dash_segment(urls, index)
+        session = _DashAtmos(
+            track_id=track_id,
+            cache_path=self._atmos_cache_path(track_id),
+            directory=directory,
+            url=url,
+            publication=publication,
+            duration_s=duration_s,
+            info=info,
+            primed=threading.Event(),
+            done=threading.Event(),
+            cancel=threading.Event(),
+        )
+        session.done_failed = False
+        previous = None
+        if preload:
+            # Registered before the writer starts, so a click landing in
+            # between adopts this session instead of publishing another.
+            with self._dash_lock:
+                previous = self._dash_preloads.get(track_id)
+                self._dash_preloads[track_id] = session
+        threading.Thread(
+            target=self._run_dash_atmos,
+            args=(session, urls, prefetched),
+            name=f"atmos-dash-{track_id}",
+            daemon=True,
+        ).start()
+        if previous is not None:
+            self._retire_dash_atmos(previous)
+        return session
+
+    def _adopt_dash_preload(
+        self, session: _DashAtmos
+    ) -> tuple[str, Optional[float], StreamInfo]:
+        """Hand a look-ahead download to the track that just clicked.
+
+        Adoption is what keeps a click free: the segments are already
+        being fetched and published, so there is no second download and
+        no wait. It also moves the session out of the preload slot, so
+        the load path's teardown owns it like any other audible stream.
+        """
+        with self._dash_lock:
+            if self._dash_preloads.get(session.track_id) is session:
+                self._dash_preloads.pop(session.track_id, None)
+            previous = self._dash_atmos
+            self._dash_atmos = session
+        if previous is not None and previous is not session:
+            self._retire_dash_atmos(previous)
+        return session.url, session.duration_s, session.info
+
+    # --- warm helper (look-ahead for the native pipeline) ------------
+
+    def _warm_native_helper(self, session: _DashAtmos) -> None:
+        """Open a preloaded track in an idle helper, paused and silent.
+
+        A native click pays three things the DASH prime does not cover:
+        spawning the helper process, loading MediaPlayer and the Dolby
+        decoder MFT, and opening the source (measured on this machine:
+        1.3 s for the spawn, another 0.4 s for the first open, 0.17 s
+        for the second). The look-ahead runs seconds before the click,
+        so paying them there turns the click into a volume change and
+        a play — which is the difference between "next song" and
+        "waited for the next song".
+
+        Only when nothing is audible natively: a playing track owns
+        its helper, and a second one would be a second output device
+        client with its own volume.
+        """
+        if not self._native_available():
+            return
+        if getattr(self, "_native_warm_lock", None) is None:
+            return
+        with self._lock:
+            if self._native is not None:
+                return
+        with self._native_warm_lock:
+            if self._native_warm is not None and self._native_warm_url == session.url:
+                return
+        threading.Thread(
+            target=self._run_warm_helper,
+            args=(session,),
+            name=f"atmos-warm-{session.track_id}",
+            daemon=True,
+        ).start()
+
+    def _run_warm_helper(self, session: _DashAtmos) -> None:
+        # A helper parked by the track that just ended is a free
+        # process; opening this source in it beats spawning another.
+        helper = self._claim_idle_helper()
+        if helper is None:
+            helper = NativeAtmosPlayer()
+        try:
+            # Silent from the start: this source is opened, never played,
+            # and a stray resume must not put it on the speakers.
+            helper.set_volume(0.0)
+            helper.set_muted(True)
+            reply = helper.load(session.url, autoplay=False, adaptive=True)
+        except Exception as exc:
+            log.debug("atmos warm: %s could not be opened: %s", session.track_id, exc)
+            helper.close()
+            return
+        if session.cancel.is_set():
+            # The look-ahead was superseded; the process is still good.
+            if not self._park_native_helper(helper):
+                helper.close()
+            return
+        with self._native_warm_lock:
+            previous = self._native_warm
+            self._native_warm = helper
+            self._native_warm_url = session.url
+            self._native_warm_reply = dict(reply or {})
+            self._native_warm_at = time.monotonic()
+        if previous is not None and previous is not helper:
+            threading.Thread(target=previous.close, daemon=True).start()
+        audio_log.info(
+            "native atmos warm: %s open and paused, waiting for the click",
+            session.track_id,
+        )
+
+    def _take_warm_helper(
+        self, url: str
+    ) -> tuple[Optional[NativeAtmosPlayer], dict]:
+        """The idle helper holding `url`, or one that can be pointed at it.
+
+        A URL match also hands back the open reply, so the caller skips
+        `load` entirely. Any other live helper comes back without a
+        reply: it is still worth taking, because opening a new source
+        costs ~0.17 s against ~0.5 s for spawning a fresh process. That
+        is the mixed-queue case — the helper was parked by the Atmos
+        track before the PCM one, so it holds that track, not this.
+        """
+        lock = getattr(self, "_native_warm_lock", None)
+        if lock is None:
+            return None, {}
+        with lock:
+            helper = self._native_warm
+            warm_url = self._native_warm_url
+            reply = self._native_warm_reply
+            opened_at = self._native_warm_at
+            self._native_warm = None
+            self._native_warm_url = None
+            self._native_warm_reply = {}
+            self._native_warm_at = 0.0
+        if helper is None:
+            return None, {}
+        stale = time.monotonic() - opened_at > _WARM_HELPER_TTL_S
+        if warm_url == url and not stale:
+            return helper, dict(reply)
+        if stale or not getattr(helper, "running", True):
+            threading.Thread(target=helper.close, daemon=True).start()
+            return None, {}
+        return helper, {}
+
+    def _claim_idle_helper(self) -> Optional[NativeAtmosPlayer]:
+        """Take whatever idle helper is standing, source and all.
+
+        Used by the look-ahead: it is about to open a new source in the
+        helper anyway, so a parked one is a free process.
+        """
+        lock = getattr(self, "_native_warm_lock", None)
+        if lock is None:
+            return None
+        with lock:
+            helper = self._native_warm
+            self._native_warm = None
+            self._native_warm_url = None
+            self._native_warm_reply = {}
+            self._native_warm_at = 0.0
+        if helper is not None and not getattr(helper, "running", True):
+            try:
+                helper.close()
+            except Exception:
+                pass
+            return None
+        return helper
+
+    def _park_native_helper(self, helper: NativeAtmosPlayer) -> bool:
+        """Keep a finished Atmos track's helper alive, silent and idle.
+
+        A mixed queue goes Atmos -> PCM -> Atmos, and the PCM load
+        closes the live helper (it must — nothing else can stop its
+        output). Closing the process means the next Atmos track pays
+        the 0.4-0.8 s spawn again; parked, that click only points
+        MediaPlayer at the new source (~0.17 s). Muted and at volume 0
+        too, so a stray resume can never put the old track on the
+        speakers behind PCM audio.
+
+        Returns False when nothing was parked and the caller should
+        close instead — a dead helper, or a look-ahead helper already
+        waiting for a track that is actually next.
+        """
+        if not getattr(helper, "running", False):
+            return False
+        lock = getattr(self, "_native_warm_lock", None)
+        if lock is None:
+            return False
+        try:
+            helper.pause()
+            helper.set_muted(True)
+            helper.set_volume(0.0)
+        except Exception as exc:
+            log.debug("native atmos park failed: %s", exc)
+            return False
+        with lock:
+            if self._native_warm is not None:
+                # A warmer helper is already aimed at the next track;
+                # two idle processes would be two output clients.
+                return False
+            self._native_warm = helper
+            self._native_warm_url = None
+            self._native_warm_reply = {}
+            self._native_warm_at = time.monotonic()
+        audio_log.info("native atmos: helper parked for the next Atmos track")
+        return True
+
+    def _reap_idle_helper(self) -> None:
+        """Close an idle helper that has outlived its adoption window.
+
+        `_take_warm_helper` would refuse it anyway; closing it here
+        bounds how long a mixed queue can leave an idle process behind
+        when no Atmos track ever comes.
+        """
+        lock = getattr(self, "_native_warm_lock", None)
+        if lock is None:
+            return
+        with lock:
+            helper = self._native_warm
+            opened_at = self._native_warm_at
+            if (
+                helper is None
+                or time.monotonic() - opened_at <= _WARM_HELPER_TTL_S
+            ):
+                return
+            self._native_warm = None
+            self._native_warm_url = None
+            self._native_warm_reply = {}
+            self._native_warm_at = 0.0
+        threading.Thread(target=helper.close, daemon=True).start()
+
+    def _close_warm_helper(self) -> None:
+        lock = getattr(self, "_native_warm_lock", None)
+        if lock is None:
+            return
+        with lock:
+            helper = self._native_warm
+            self._native_warm = None
+            self._native_warm_url = None
+            self._native_warm_reply = {}
+            self._native_warm_at = 0.0
+        if helper is not None:
+            helper.close()
+
+    def _drop_warm_helper_for(self, url: str) -> None:
+        """Close the idle helper when the stream it holds is retired."""
+        lock = getattr(self, "_native_warm_lock", None)
+        if lock is None:
+            return
+        with lock:
+            if self._native_warm_url != url:
+                return
+            helper = self._native_warm
+            self._native_warm = None
+            self._native_warm_url = None
+            self._native_warm_reply = {}
+            self._native_warm_at = 0.0
+        if helper is not None:
+            threading.Thread(target=helper.close, daemon=True).start()
+
+    def _start_dash_atmos(
+        self,
+        track_id: str,
+        urls: list[str],
+        prefetched: Optional[dict[int, bytes]],
+        duration_s: Optional[float],
+        info: StreamInfo,
+        load_seq: Optional[int],
+    ) -> Optional[_DashAtmos]:
+        """Publish a downloading track as DASH and wait for it to prime.
+
+        The whole-file path makes the click wait for 20-30 MB; this
+        writes the same bytes into a DASH presentation one segment at a
+        time, and MediaPlayer starts as soon as the init segment and
+        the first 4 s fragment exist. A look-ahead download for the same
+        track is adopted rather than started again. Returns the session
+        once primed, or None after cancelling the writer — the caller
+        then buffers the file the old way, which is the only fallback
+        that cannot leave the user with silence.
+        """
+        session = self._take_dash_preload(track_id)
+        if session is None:
+            try:
+                session = self._publish_dash_atmos(
+                    track_id,
+                    urls,
+                    prefetched,
+                    duration_s,
+                    info,
+                    preload=False,
+                )
+            except Exception as exc:
+                # A filesystem or publication failure must not fail the
+                # load: the caller's fallback buffers the same bytes into
+                # the cache dir, and the PCM engine is behind that.
+                log.warning(
+                    "atmos dash: publish failed for %s: %s", track_id, exc
+                )
+                return None
+        with self._dash_lock:
+            previous = self._dash_atmos
+            self._dash_atmos = session
+
+        deadline = time.monotonic() + _DASH_PRIME_DEADLINE_S
+        t0 = time.monotonic()
+        while not session.primed.is_set():
+            if session.done.is_set() or session.done_failed:
+                break
+            if time.monotonic() > deadline:
+                break
+            if load_seq is not None and self._load_seq != load_seq:
+                break
+            time.sleep(_DASH_POLL_S)
+        if session.primed.is_set() and not session.done_failed:
+            log.info(
+                "atmos dash: primed %s in %.0f ms",
+                session.directory,
+                (time.monotonic() - t0) * 1000.0,
+            )
+            # This track replaces whatever was playing, and a look-ahead
+            # download for another track has nothing left to feed.
+            if previous is not None and previous is not session:
+                self._retire_dash_atmos(previous)
+            self._retire_dash_preloads()
+            return session
+        self._retire_dash_atmos(session)
+        # Either way this track replaces whatever was playing before, so
+        # that stream has nothing left to feed.
+        if previous is not None:
+            self._retire_dash_atmos(previous)
+        # The writer might be between segments; the fallback opens the
+        # same cache path and cannot replace a file another handle
+        # still holds open on Windows.
+        session.done.wait(_DASH_CANCEL_WAIT_S)
+        log.info("atmos dash: gave up on %s, buffering the file", track_id)
+        return None
+
+    def _fetch_dash_segment(
+        self, urls: list[str], index: int
+    ) -> Optional[bytes]:
+        """Pull one segment out of order, for a seek.
+
+        MediaPlayer waits on the segment under the drop point. The
+        sequential pass is at best a few seconds behind, and after a
+        jump to the end of a track it is minutes behind — waiting for
+        it is what made a seek appear to hang. One request here answers
+        the seek, and the join reuses these same bytes when it catches
+        up instead of downloading them again.
+        """
+        from app.http import SESSION
+
+        if index <= 0 or index >= len(urls):
+            return None
+        started = time.monotonic()
+        try:
+            resp = SESSION.get(urls[index], stream=True, timeout=30)
+            try:
+                resp.raise_for_status()
+                data = b"".join(
+                    piece
+                    for piece in resp.iter_content(chunk_size=65536)
+                    if piece
+                )
+            finally:
+                resp.close()
+        except Exception as exc:
+            log.debug("atmos dash: seek fetch of segment %d failed: %s", index, exc)
+            return None
+        log.info(
+            "atmos dash: segment %d on demand in %.0f ms (%d bytes)",
+            index,
+            (time.monotonic() - started) * 1000.0,
+            len(data),
+        )
+        return data
+
+    def _run_dash_atmos(
+        self,
+        session: _DashAtmos,
+        urls: list[str],
+        prefetched: Optional[dict[int, bytes]],
+    ) -> None:
+        """Download one track as DASH and join it into the cache file.
+
+        Each segment is written to the published directory and appended
+        to the joined file in the same pass, so the bytes are read once.
+        A seek can pull a segment ahead of this pass (`fetch`); when the
+        pass reaches it, the copy already on disk is joined instead of
+        being downloaded a second time.
+        The join is what the buffered-track cache serves from then on —
+        the next play of this track opens a plain file — and it is also
+        what the loudness scan measures. One connection is opened ahead
+        of the body being streamed, the same overlap the whole-file
+        downloader uses and deliberately no more.
+        """
+        from app.http import SESSION
+
+        publication = session.publication
+        part = f"{session.cache_path}.{threading.get_ident()}.part"
+        deadline = time.monotonic() + _DASH_DEADLINE_S
+        have = prefetched or {}
+        written = 0
+        t0 = time.monotonic()
+        ok = False
+
+        def _abandoned() -> bool:
+            return session.cancel.is_set() or time.monotonic() > deadline
+
+        def _open(url: str):
+            return SESSION.get(url, stream=True, timeout=60)
+
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="atmos-dash")
+        next_resp = None
+        def _discard(future) -> None:
+            # The connection was opened ahead for bytes an out-of-order
+            # fetch has since delivered; close it instead of pulling the
+            # same segment down twice.
+            if future is None:
+                return
+            try:
+                future.result().close()
+            except Exception:
+                pass
+
+        try:
+            with open(part, "wb") as fh:
+
+                def _write(index: int, data: bytes) -> None:
+                    nonlocal written
+                    fh.write(data)
+                    written += len(data)
+                    if index == 0:
+                        dash_server.write_init(publication, data)
+                    else:
+                        dash_server.write_segment(publication, index, data)
+                    if index == 1:
+                        session.primed.set()
+
+                idx = 0
+                # Seeds fetched by hover/album prefetch (init + first
+                # media segment) are already in memory — which is why
+                # a primed session usually costs no new request at all.
+                while idx in have and idx < len(urls):
+                    _write(idx, have[idx])
+                    idx += 1
+                next_resp = (
+                    pool.submit(_open, urls[idx]) if idx < len(urls) else None
+                )
+                while idx < len(urls):
+                    if _abandoned():
+                        raise RuntimeError("atmos dash abandoned")
+                    local = publication.local_segment(idx)
+                    if local is not None:
+                        # A seek fetched this one out of order; the join
+                        # takes those bytes instead of downloading again.
+                        _discard(next_resp)
+                        next_resp = None
+                        _write(idx, local)
+                    else:
+                        resp = (
+                            next_resp.result()
+                            if next_resp is not None
+                            else _open(urls[idx])
+                        )
+                        next_resp = None
+                        try:
+                            resp.raise_for_status()
+                            pieces: list[bytes] = []
+                            for piece in resp.iter_content(chunk_size=65536):
+                                if _abandoned():
+                                    raise RuntimeError("atmos dash abandoned")
+                                if piece:
+                                    pieces.append(piece)
+                            _write(idx, b"".join(pieces))
+                        finally:
+                            try:
+                                resp.close()
+                            except Exception:
+                                pass
+                    idx += 1
+                    next_resp = (
+                        pool.submit(_open, urls[idx])
+                        if idx < len(urls)
+                        and publication.local_segment(idx) is None
+                        else None
+                    )
+            os.replace(part, session.cache_path)
+            self._native_stream_store(
+                session.track_id, session.cache_path, session.duration_s, session.info
+            )
+            ok = True
+        except Exception as exc:
+            log.debug("atmos dash write failed for %s: %s", session.track_id, exc)
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+        finally:
+            # Never wait on a pending request here: on abandonment it
+            # can still be sitting on its 60 s read timeout.
+            pool.shutdown(wait=False, cancel_futures=True)
+            if not ok:
+                session.done_failed = True
+            # Pending segment requests are released either way; on a
+            # failure MediaPlayer gets 404s instead of hanging.
+            dash_server.note_done(publication, failed=not ok)
+            session.done.set()
+        _perf = (
+            f"[perf] atmos dash track={session.track_id} "
+            f"segments={len(urls)} bytes={written} "
+            f"elapsed={(time.monotonic() - t0) * 1000.0:.0f}ms"
+        )
+        print(_perf, file=sys.stderr, flush=True)
+        audio_log.info(_perf)
+
+    def _finish_dash_atmos(self, session: _DashAtmos) -> Optional[str]:
+        """Wait (bounded) for a refused stream to finish downloading.
+
+        Reached when the helper will not take the adaptive source. The
+        download is still running and its bytes are the only copy, so
+        the fallback inside the native path opens the joined file
+        rather than downloading the track again.
+        """
+        session.done.wait(_DASH_FALLBACK_WAIT_S)
+        if session.done_failed:
+            return None
+        if os.path.exists(session.cache_path):
+            return session.cache_path
+        return None
+
+    def _retire_dash_atmos(self, session: _DashAtmos) -> None:
+        """Stop serving a DASH track and end its download.
+
+        Non-blocking: the writer notices `cancel` between segments and
+        pending requests see `done`, so nothing here waits on the
+        network. The segment directory cannot be removed while
+        MediaPlayer still has the source open, so the delete is retried
+        briefly on a thread and the startup sweep takes what is left.
+        """
+        with self._dash_lock:
+            if self._dash_atmos is session:
+                self._dash_atmos = None
+            if self._dash_preloads.get(session.track_id) is session:
+                self._dash_preloads.pop(session.track_id, None)
+        session.cancel.set()
+        try:
+            dash_server.retire(session.publication)
+        except Exception as exc:
+            log.debug("atmos dash retire failed: %s", exc)
+        # A helper opened on this stream has nothing left to serve.
+        self._drop_warm_helper_for(session.url)
+        threading.Thread(
+            target=_remove_dash_dir,
+            args=(session.directory,),
+            name="atmos-dash-cleanup",
+            daemon=True,
+        ).start()
+
+    def _retire_dash_sessions(self, keep: Optional[_DashAtmos] = None) -> None:
+        """End every published stream except `keep` — the track the
+        caller is about to open."""
+        with self._dash_lock:
+            targets = [
+                session
+                for session in [self._dash_atmos, *self._dash_preloads.values()]
+                if session is not None and session is not keep
+            ]
+        for session in targets:
+            self._retire_dash_atmos(session)
+
+    def _retire_dash_preloads(self, keep: Optional[str] = None) -> None:
+        """End the look-ahead downloads, all but the one for `keep`."""
+        with self._dash_lock:
+            targets = [
+                session
+                for track_id, session in self._dash_preloads.items()
+                if track_id != keep
+            ]
+        for session in targets:
+            self._retire_dash_atmos(session)
+
+    def _measured_native_gain(self, measured: dict) -> float:
+        return compute_measured_gain_db(
+            measured.get("lufs"),
+            measured.get("peak"),
+            loudness.TARGET_LUFS,
+            self._replaygain_preamp_db,
+            self._replaygain_prevent_clipping,
+        )
+
+    def _native_gain_plan(
+        self, info: StreamInfo, path: str
+    ) -> tuple[float, Optional[float], str]:
+        """Resolve the leveling offset for one native track.
+
+        Returns `(gain_db, loudness_lufs, source)`. Tags win when the
+        file carries them (TIDAL's own measurement, free). A
+        downloaded Atmos file has none, so fall back to the local R128
+        scan — `"pending"` while the first scan of that file runs, at
+        which point the track plays flat until the scan lands.
+        """
+        if self._replaygain_mode == "off":
+            return 0.0, None, "off"
+        tags = _replaygain_tags_from(info)
+        if self._replaygain_mode == "track":
+            has_tag = tags.track_gain_db is not None
+        else:
+            has_tag = tags.album_gain_db is not None
+        if has_tag:
+            return (
+                compute_replaygain_db(
+                    tags,
+                    self._replaygain_mode,
+                    self._replaygain_preamp_db,
+                    self._replaygain_prevent_clipping,
+                ),
+                None,
+                "tags",
+            )
+        if path.startswith(("http://", "https://")):
+            # A DASH manifest: the joined file does not exist yet, and a
+            # scan would measure however many segments have landed. The
+            # writer measures the finished file (see _start_loudness_scan).
+            return 0.0, None, "pending"
+        measured = loudness.cached(path)
+        if measured is None:
+            return 0.0, None, "pending"
+        lufs = measured.get("lufs")
+        if not isinstance(lufs, (int, float)):
+            return 0.0, None, "none"
+        return self._measured_native_gain(measured), float(lufs), "measured"
+
+    def _push_native_gain(self, helper: NativeAtmosPlayer, info: StreamInfo) -> None:
+        """Re-resolve and apply the offset to a live helper. Called
+        when the user changes the mode/preamp mid-track — the native
+        path has no per-callback hook to pick the change up later."""
+        path = self._source_path
+        if not path:
+            return
+        gain_db, lufs, source = self._native_gain_plan(info, path)
+        if source == "pending":
+            # A scan is already running and will push its own result.
+            return
+        try:
+            reply = helper.set_gain_db(gain_db)
+        except Exception as exc:
+            log.warning("native atmos gain failed: %s", exc)
+            return
+        with self._lock:
+            if self._native is not helper:
+                return
+            self._native_gain_db = gain_db
+            self._native_gain_applied_db = float(
+                reply.get("gain_applied_db") or 0.0
+            )
+            self._native_gain_source = source
+            self._native_loudness_lufs = lufs
+
+    def _start_loudness_scan(
+        self,
+        helper: NativeAtmosPlayer,
+        path: str,
+        dash: Optional[_DashAtmos] = None,
+    ) -> None:
+        # play() starts this whenever the gain is still pending, so a
+        # pause/resume mid-scan must not launch a second full decode.
+        key = dash.cache_path if dash is not None else path
+        with self._loudness_scan_lock:
+            if self._loudness_scan_path == key:
+                return
+            self._loudness_scan_path = key
+
+        def _run() -> None:
+            try:
+                target = path
+                if dash is not None:
+                    # A URL names a download in progress: the scan has to
+                    # wait for the joined file, or it measures a truncated
+                    # track and levels the next play off a bad number. A
+                    # cancelled download is a partial file, which is no
+                    # measurement at all.
+                    if not dash.done.wait(_DASH_DEADLINE_S):
+                        return
+                    if dash.done_failed:
+                        return
+                    target = dash.cache_path
+                self._scan_native_loudness(helper, target)
+            finally:
+                with self._loudness_scan_lock:
+                    if self._loudness_scan_path == key:
+                        self._loudness_scan_path = None
+
+        thread = threading.Thread(
+            target=_run,
+            name="native-loudness-scan",
+            daemon=True,
+        )
+        thread.start()
+
+    def _scan_native_loudness(
+        self, helper: NativeAtmosPlayer, path: str
+    ) -> None:
+        """Measure a missing-tag file and apply the result to the
+        track that is currently playing it. The scan is a full decode,
+        so it runs off the playback path; if the user has moved on by
+        the time it finishes, the result is still cached and the next
+        play of that file starts level."""
+        measured = loudness.analyze(path)
+        lufs = measured.get("lufs") if measured else None
+        with self._lock:
+            if self._native is not helper:
+                return
+            if lufs is None:
+                self._native_gain_source = "none"
+                return
+            gain_db = self._measured_native_gain(measured)
+        try:
+            reply = helper.set_gain_db(gain_db)
+        except Exception as exc:
+            log.warning("native atmos loudness gain failed: %s", exc)
+            return
+        applied = float(reply.get("gain_applied_db") or 0.0)
+        with self._lock:
+            if self._native is not helper:
+                return
+            self._native_gain_db = gain_db
+            self._native_gain_applied_db = applied
+            self._native_gain_source = "measured"
+            self._native_loudness_lufs = float(lufs)
+            volume = self._volume
+        audio_log.info(
+            "native atmos loudness: %s measured %.1f LUFS, "
+            "target %.1f, gain %+.2f dB (applied %+.2f dB at volume %d)",
+            path,
+            float(lufs),
+            loudness.TARGET_LUFS,
+            gain_db,
+            applied,
+            volume,
+        )
+        self._emit()
+
+    def _native_open(
+        self, helper: NativeAtmosPlayer, path: str
+    ) -> tuple[dict, str]:
+        """Open `path` in the helper, resolving a DASH presentation.
+
+        `path` is either a plain file or the manifest URL of a track
+        whose segments are still downloading. The helper builds an
+        adaptive source from the manifest, which MediaPlayer streams
+        segment by segment — the only source kind it starts before the
+        whole asset exists. If it refuses, the writer is still running,
+        so wait for the joined file and open that rather than
+        downloading the track again. Returns the reply and the path
+        that actually opened.
+        """
+        session = self._dash_for_url(path)
+        if session is None:
+            return helper.load(path, autoplay=False), path
+        try:
+            return helper.load(path, autoplay=False, adaptive=True), path
+        except Exception as exc:
+            log.warning(
+                "native atmos dash open failed for %s (%s); "
+                "waiting for the finished file",
+                session.track_id,
+                exc,
+            )
+            finished = self._finish_dash_atmos(session)
+            if finished is None:
+                raise
+            return helper.load(finished, autoplay=False), finished
+
+    def _try_load_native(
+        self,
+        track_id: str,
+        path: str,
+        duration_s: Optional[float],
+        info: StreamInfo,
+    ) -> Optional[PlayerSnapshot]:
+        """Open `path` in the native pipeline, paused. None = failed,
+        caller falls through to the PCM engine (dead helper, unsupported
+        endpoint, etc.) rather than failing the play outright."""
+        with self._lock:
+            if (
+                self._current_track_id == track_id
+                and self._native is not None
+                and self._state in ("playing", "paused")
+            ):
+                return self.snapshot()
+        t0 = time.monotonic()
+        # Atmos -> Atmos is the common skip, and it is the one case
+        # where the helper is already standing: keep the process and
+        # let `load` swap the source instead of paying the spawn.
+        # A DASH session named by `path` survives the teardown too: its
+        # writer is feeding the segments MediaPlayer is about to open,
+        # and retiring it here would cut the new track's own source.
+        # Everything else is retired, matching the old track.
+        dash = self._dash_for_url(path)
+        helper = self._teardown(keep_native=True, keep_dash=dash)
+        t_teardown = time.monotonic()
+        with self._lock:
+            self._transition("loading", track_id=track_id)
+
+        reused = helper is not None
+        warm_reply: dict = {}
+        if helper is None:
+            # The look-ahead may have left a helper holding this exact
+            # source, opened paused: adopting it skips the spawn and the
+            # first open, which together are most of a cold click.
+            helper, warm_reply = self._take_warm_helper(path)
+            reused = helper is not None
+        if helper is None:
+            helper = NativeAtmosPlayer()
+        gain_reply: dict = {}
+        try:
+            # Inside the try: a kept helper is a live process, so any
+            # failure below has to reach the close() in `except` —
+            # otherwise a leveling error would leave it running.
+            gain_db, loudness_lufs, gain_source = self._native_gain_plan(
+                info, path
+            )
+            if warm_reply:
+                reply, opened_path = warm_reply, path
+            else:
+                reply, opened_path = self._native_open(helper, path)
+            t_open = time.monotonic()
+            if opened_path != path:
+                # MediaPlayer refused the growing stream and the
+                # finished file opened instead; level against that.
+                gain_db, loudness_lufs, gain_source = self._native_gain_plan(
+                    info, opened_path
+                )
+            helper.set_volume(self._volume)
+            helper.set_muted(self._muted)
+            # Set before play() so the first sample is already levelled
+            # — MediaPlayer would otherwise start loud and drop. A
+            # helper that refuses the offset must still play the
+            # track: leveling is optional, the decode is not.
+            try:
+                gain_reply = helper.set_gain_db(gain_db)
+            except Exception as exc:
+                log.warning("native atmos gain failed for %s: %s", path, exc)
+            # load() opens the source and stops there: the restore path
+            # calls it for the persisted track on every launch and
+            # expects silence until the user presses play. Starting
+            # here is also what made rapid Next presses flash each
+            # intermediate track. play_track() follows with play(),
+            # which starts the helper and its monitor.
+        except Exception as exc:
+            log.warning(
+                "native Atmos playback failed for %s (%s); falling back "
+                "to the PCM engine",
+                path,
+                exc,
+            )
+            audio_log.warning("native atmos fallback: %s", exc)
+            helper.close()
+            return None
+
+        duration_ms = (
+            int(duration_s * 1000)
+            if duration_s
+            else int(reply.get("dur_ms") or 0)
+        )
+        with self._lock:
+            self._native = helper
+            self._native_info = info
+            self._native_duration_ms = duration_ms
+            self._native_pos_ms = int(reply.get("pos_ms") or 0)
+            self._native_pos_at = time.monotonic()
+            self._native_playback_state = "Paused"
+            self._native_decoders = list(reply.get("decoders") or [])
+            self._native_device = str(reply.get("device") or "")
+            self._native_spatial_format = str(reply.get("spatial_format") or "")
+            self._native_spatial_supported = bool(
+                reply.get("spatial_supported") or False
+            )
+            self._native_gain_db = gain_db
+            self._native_gain_applied_db = float(
+                gain_reply.get("gain_applied_db") or 0.0
+            )
+            self._native_gain_source = gain_source
+            self._native_loudness_lufs = loudness_lufs
+            self._current_duration_ms = duration_ms
+            self._current_stream_info = info
+            self._stream_sample_rate = None
+            self._stream_sd_dtype = None
+            self._stream_channels = None
+            self._source_path = opened_path
+            self._source_urls = None
+            self._samples_emitted = 0
+            self._paused = True
+            self._seeking = False
+            self._last_error = None
+            self._transition("paused")
+        audio_log.info(
+            "native atmos: opened %s paused decoders=%s device=%r "
+            "gain=%+.2f dB (%s)",
+            path,
+            self._native_decoders,
+            self._native_device,
+            gain_db,
+            gain_source,
+        )
+        if dash is not None and opened_path != path:
+            # The adaptive source was refused, so nothing is reading the
+            # segments any more; the joined file is what the cache now
+            # serves.
+            self._retire_dash_atmos(dash)
+        # The PCM path logs a phase breakdown for every load; the native
+        # path had none, which made "is the wait the download or the
+        # engine switch?" unanswerable from audio.log. `helper_open`
+        # covers the PowerShell spawn plus MediaPlayer opening the
+        # source — the actual switch cost.
+        _perf = (
+            f"[perf] load native track={track_id} "
+            f"total={(time.monotonic() - t0) * 1000.0:.0f}ms "
+            f"teardown={(t_teardown - t0) * 1000.0:.0f}ms "
+            f"helper_open={(t_open - t_teardown) * 1000.0:.0f}ms "
+            f"helper={'warm' if warm_reply else ('reused' if reused else 'spawned')}"
+        )
+        print(_perf, file=sys.stderr, flush=True)
+        audio_log.info(_perf)
+        self._emit()
+        return self.snapshot()
+
+    def _start_native_monitor(self) -> None:
+        with self._lock:
+            stop = self._native_monitor_stop
+            helper = self._native
+        if stop is not None:
+            stop.set()
+        if helper is None:
+            return
+        stop = threading.Event()
+        with self._lock:
+            self._native_monitor_stop = stop
+        thread = threading.Thread(
+            target=self._native_monitor_loop,
+            args=(helper, stop),
+            name="native-atmos-monitor",
+            daemon=True,
+        )
+        self._native_monitor = thread
+        thread.start()
+
+    def _native_monitor_loop(
+        self, helper: NativeAtmosPlayer, stop: threading.Event
+    ) -> None:
+        """Keep position/state fresh and catch end-of-track.
+
+        MediaPlayer has no event for "played to the end" that survives
+        the helper's line protocol, so poll: a state that is no longer
+        Playing while the position sits at the duration means EOF.
+
+        A state that drops to Paused mid-track is the other kind of
+        stop: Windows moved or reconfigured the audio device (a
+        Spatial Sound change is the common one) and MediaPlayer
+        parked itself. Resume it rather than leaving a "playing"
+        player that is silent.
+        """
+        last_resume_attempt = 0.0
+        resume_attempts = 0
+        # MediaPlayer takes a moment to produce its first sample. While
+        # it does, the UI reads this snapshot — poll tightly so the
+        # track visibly starts instead of sitting at 0:00, then fall
+        # back to the cheap cadence for the rest of the track.
+        started = time.monotonic()
+        while not stop.wait(
+            0.15 if time.monotonic() - started < 2.0 else 0.5
+        ):
+            with self._lock:
+                if self._native is not helper:
+                    return
+                player_state = self._state
+            if player_state not in ("playing", "paused"):
+                return
+            try:
+                reply = helper.state()
+            except Exception as exc:
+                with self._lock:
+                    if self._native is not helper:
+                        return
+                    self._last_error = str(exc)
+                    self._transition("error")
+                audio_log.warning("native atmos helper lost: %s", exc)
+                self._emit()
+                return
+
+            pos_ms = int(reply.get("pos_ms") or 0)
+            dur_ms = int(reply.get("dur_ms") or 0)
+            raw_state = str(reply.get("state") or "")
+            playing = raw_state == "Playing"
+            ended = False
+            needs_resume = False
+            with self._lock:
+                if self._native is not helper:
+                    return
+                self._native_pos_ms = pos_ms
+                self._native_pos_at = time.monotonic()
+                self._native_playback_state = raw_state
+                if dur_ms:
+                    self._native_duration_ms = dur_ms
+                    if dur_ms > self._current_duration_ms:
+                        self._current_duration_ms = dur_ms
+                self._native_decoders = list(reply.get("decoders") or [])
+                device = str(reply.get("device") or "")
+                if device:
+                    self._native_device = device
+                self._native_spatial_format = str(reply.get("spatial_format") or "")
+                self._native_spatial_supported = bool(
+                    reply.get("spatial_supported") or False
+                )
+                if (
+                    not playing
+                    and dur_ms > 0
+                    and pos_ms >= dur_ms - 400
+                    and self._state == "playing"
+                ):
+                    self._paused = False
+                    self._transition("ended")
+                    ended = True
+                elif (
+                    raw_state == "Paused"
+                    and self._state == "playing"
+                    and pos_ms < dur_ms - 400
+                ):
+                    needs_resume = True
+            if ended:
+                self._emit()
+                return
+            if playing:
+                resume_attempts = 0
+            elif needs_resume:
+                now = time.monotonic()
+                if now - last_resume_attempt >= 3.0 and resume_attempts < 20:
+                    last_resume_attempt = now
+                    resume_attempts += 1
+                    try:
+                        helper.play()
+                        audio_log.info(
+                            "native atmos: MediaPlayer dropped to Paused "
+                            "at %.1fs; resumed",
+                            pos_ms / 1000.0,
+                        )
+                    except Exception as exc:
+                        audio_log.warning(
+                            "native atmos: resume after drop-out failed: %s",
+                            exc,
+                        )
+
+    def native_atmos_status(self) -> Optional[dict]:
+        """Diagnostics for the active native stream (None when the
+        current pipeline is PCM)."""
+        with self._lock:
+            if self._native is None:
+                return None
+            return {
+                "path": self._source_path,
+                "state": self._native_playback_state,
+                "device": self._native_device,
+                "decoders": list(self._native_decoders),
+                "spatial_format": self._native_spatial_format,
+                "spatial_supported": self._native_spatial_supported,
+                "duration_ms": self._native_duration_ms,
+                "gain_db": self._native_gain_db,
+                "gain_applied_db": self._native_gain_applied_db,
+                "gain_source": self._native_gain_source,
+                "loudness_lufs": self._native_loudness_lufs,
+            }
+
+    def last_open_diagnostics(self) -> Optional[dict]:
+        with self._lock:
+            diag = self._last_open_diag
+            return dict(diag) if diag else None
+
+    def _clear_native_locked(
+        self,
+    ) -> tuple[Optional[NativeAtmosPlayer], Optional[threading.Event]]:
+        """Detach the native pipeline. Returns the helper + monitor
+        stop event so the caller can dispose of them outside `_lock`
+        (closing the helper waits on a process handshake)."""
+        with self._lock:
+            helper = self._native
+            stop = self._native_monitor_stop
+            self._native = None
+            self._native_monitor = None
+            self._native_monitor_stop = None
+            self._native_info = None
+            self._native_duration_ms = 0
+            self._native_pos_ms = 0
+            self._native_pos_at = 0.0
+            self._native_playback_state = None
+            self._native_decoders = []
+            self._native_device = ""
+            self._native_spatial_format = ""
+            self._native_spatial_supported = False
+            self._native_gain_db = 0.0
+            self._native_gain_applied_db = 0.0
+            self._native_gain_source = "off"
+            self._native_loudness_lufs = None
+            return helper, stop
+
     def play_track(
         self, track_id: str, quality: Optional[str] = None
     ) -> PlayerSnapshot:
@@ -1033,16 +3214,81 @@ class PCMPlayer:
         counter. When it moved, we stop at "loaded but not playing" —
         the same state a load()-without-play caller lands in — and the
         next play() starts the stream."""
+        # Claim this click BEFORE queueing for `_pipeline_lock`, exactly
+        # like load(). A rapid Next press produces one play_track per
+        # track; the requests arrive together, so the ones still
+        # waiting behind an in-flight load must be able to mark that
+        # load dead at its next checkpoint. Bumping inside the lock
+        # (as this used to, via load()) only ever happened after the
+        # earlier click had finished loading and started playing its
+        # intermediate track.
+        with self._lock:
+            self._load_seq = getattr(self, "_load_seq", 0) + 1
+            self._load_target_id = track_id
+            load_seq = self._load_seq
+        # Sample the pause counter out here too: a pause that lands
+        # while this click waits for the pipeline lock must still be
+        # honoured, not overwritten when play() runs.
+        pause_requests_before = self._pause_requests
         with self._pipeline_lock:
-            pause_requests_before = self._pause_requests
-            snap = self.load(track_id, quality=quality)
+            snap = self._load_locked(track_id, quality, load_seq)
             if snap.state == "error":
                 return snap
             if self._pause_requests != pause_requests_before:
                 return snap
+            if self._load_superseded(load_seq, track_id):
+                # A newer click is queued behind this play_track. Do
+                # not press play: the load either skipped its audio or
+                # left the native helper holding the source paused for
+                # the newer load to take over.
+                self._dbg(
+                    f"play_track: superseded; not starting {track_id}"
+                )
+                return snap
             return self.play()
 
     def play(self) -> PlayerSnapshot:
+        with self._lock:
+            native = self._native
+            gain_source = self._native_gain_source
+            source_path = self._source_path
+        if native is not None:
+            try:
+                native.play()
+            except Exception as exc:
+                log.exception("native atmos play failed")
+                with self._lock:
+                    self._last_error = str(exc)
+                    self._transition("error")
+                self._emit()
+                return self.snapshot()
+            with self._lock:
+                self._paused = False
+                self._native_playback_state = "Playing"
+                self._native_pos_at = time.monotonic()
+                self._transition("playing")
+                decoders = list(self._native_decoders)
+                device = self._native_device
+                gain_db = self._native_gain_db
+            # load() opens a native source paused, so the launch restore
+            # stays silent; the monitor (position + end-of-track) and
+            # the loudness scan only have work once it is audible.
+            self._start_native_monitor()
+            if gain_source == "pending" and source_path:
+                self._start_loudness_scan(
+                    native, source_path, self._dash_for_url(source_path)
+                )
+            audio_log.info(
+                "native atmos: playing %s decoders=%s device=%r "
+                "gain=%+.2f dB (%s)",
+                source_path,
+                decoders,
+                device,
+                gain_db,
+                gain_source,
+            )
+            self._emit()
+            return self.snapshot()
         with self._lock:
             stream = self._stream
             if stream is None:
@@ -1059,8 +3305,7 @@ class PCMPlayer:
             else:
                 self._paused = False
                 try:
-                    if not stream.active:
-                        self._start_stream(stream)
+                    self._ensure_stream_started()
                 except Exception as exc:
                     log.exception("stream.start failed")
                     self._last_error = str(exc)
@@ -1072,6 +3317,25 @@ class PCMPlayer:
         return self.snapshot()
 
     def pause(self) -> PlayerSnapshot:
+        with self._lock:
+            native = self._native
+            state = self._state
+        if native is not None:
+            if state not in ("playing", "loading"):
+                return self.snapshot()
+            try:
+                native.pause()
+            except Exception as exc:
+                log.warning("native atmos pause failed: %s", exc)
+            with self._lock:
+                if self._native is not native:
+                    return self.snapshot()
+                self._pause_requests += 1
+                self._paused = True
+                self._native_playback_state = "Paused"
+                self._transition("paused")
+            self._emit()
+            return self.snapshot()
         with self._lock:
             if self._state not in ("playing", "loading"):
                 return self.snapshot()
@@ -1119,11 +3383,26 @@ class PCMPlayer:
         with self._pipeline_lock:
             fraction = max(0.0, min(1.0, float(fraction)))
             with self._lock:
+                native = self._native
                 duration_ms = self._current_duration_ms
                 sample_rate = self._stream_sample_rate or 44100
                 if duration_ms <= 0:
                     return self.snapshot()
                 target_s = (duration_ms / 1000.0) * fraction
+                target_ms = int(duration_ms * fraction)
+            if native is not None:
+                try:
+                    native.seek_ms(target_ms)
+                except Exception as exc:
+                    log.warning("native atmos seek failed: %s", exc)
+                    return self.snapshot()
+                with self._lock:
+                    if self._native is native:
+                        self._native_pos_ms = target_ms
+                        self._native_pos_at = time.monotonic()
+                        self._seq += 1
+                self._emit()
+                return self.snapshot()
             self._dbg(
                 f"seek ENTER fraction={fraction} target_s={target_s:.2f} "
                 f"duration_ms={duration_ms} sample_rate={sample_rate} "
@@ -1252,7 +3531,14 @@ class PCMPlayer:
 
         new_source, start_offset_s = self._build_source_at(target_s)
         t_source_built = time.monotonic()
-        new_decoder = Decoder(new_source)
+        # Seek on a surround (Atmos) stream: the replacement decoder
+        # must emit the same channel count the open OutputStream is
+        # configured for, or every post-seek sample would be dropped by
+        # the callback's shape check.
+        stream_channels = self._stream_channels or 0
+        new_decoder = Decoder(new_source, surround=stream_channels > 2)
+        if stream_channels > 2:
+            new_decoder.set_target_channels(stream_channels)
         # Match the existing OutputStream's configuration. The stream
         # stays open across a seek; the OLD decoder was configured to
         # emit at `_stream_sample_rate` / matching dtype via the
@@ -1329,6 +3615,7 @@ class PCMPlayer:
         self,
         source_spec: Union[str, list[str]],
         prefetched: Optional[dict[int, bytes]],
+        sink: Optional[object] = None,
     ) -> Union[str, SegmentReader]:
         """Source for the local decoder.
 
@@ -1374,7 +3661,7 @@ class PCMPlayer:
                 "[pcm] cast: no bounded file for this source; using URL source",
                 flush=True,
             )
-        return _build_source(source_spec, prefetched=prefetched)
+        return _build_source(source_spec, prefetched=prefetched, sink=sink)
 
     def _build_source_at(
         self, target_s: float
@@ -1387,7 +3674,15 @@ class PCMPlayer:
             urls = self._source_urls
             num_media = len(urls) - 1
             duration_s = (self._current_duration_ms or 1000) / 1000.0
-            if target_s <= 0 or num_media == 0:
+            if num_media == 0:
+                # Single-URL source (the AAC tiers' progressive MP4):
+                # there is no segment to jump to, so hand the whole
+                # source back with "unknown offset" and let the decoder
+                # seek through the MP4 sample table. The old 0.0 return
+                # told the player the new reader already started at the
+                # target — every Low-tier seek restarted from 0:00.
+                return SegmentReader(urls), None
+            if target_s <= 0:
                 return SegmentReader(urls), 0.0
             idx = max(
                 0,
@@ -1415,6 +3710,10 @@ class PCMPlayer:
         callback can splice it into the current OutputStream at
         end-of-current-track — sample-accurate gapless.
 
+        A streamed Atmos track can't be spliced that way: Windows'
+        pipeline opens one finished file, so this starts downloading it
+        in the background instead (see `_preload_atmos_stream`).
+
         Idempotent for the same (track_id, quality); swapping the
         request to a different track tears down the existing
         preload first. Serialized on `_pipeline_lock` alongside
@@ -1427,6 +3726,16 @@ class PCMPlayer:
         # what tells a late pre-stage apart from a preload that never
         # fired.
         print(f"[pcm] preload request track={track_id}", flush=True)
+        if self._native_candidate(track_id, quality) is not None:
+            # A local Atmos file: the native pipeline opens it directly,
+            # so there is nothing for the PCM preload queue to hold.
+            return {"ok": True, "native": True, "hit": False}
+        if self._stream_atmos_eligible(track_id, quality):
+            # Same, except the asset is still on TIDAL. There is no PCM
+            # buffer worth priming (MediaPlayer wants the whole file),
+            # so this downloads it in the background instead — that is
+            # what makes the click at track-end start with no wait.
+            return self._preload_atmos_stream(track_id, quality)
         with self._pipeline_lock:
             with self._lock:
                 existing = self._preload
@@ -1514,8 +3823,21 @@ class PCMPlayer:
             return {"ok": True, "cached": False, "cast": True}
 
         try:
-            source = _build_source(source_spec, prefetched=prefetched_bytes)
-            decoder = Decoder(source)
+            source = _build_source(
+                source_spec,
+                prefetched=prefetched_bytes,
+                sink=self._pcm_stream_cache_sink(
+                    track_id,
+                    quality,
+                    source_spec,
+                    duration_s,
+                    stream_info,
+                    track_meta,
+                ),
+            )
+            decoder = Decoder(
+                source, surround=_is_atmos_stream_info(stream_info)
+            )
         except Exception as exc:
             log.exception("preload resolve failed for %s", track_id)
             return {"ok": False, "error": str(exc)}
@@ -1677,8 +3999,21 @@ class PCMPlayer:
                     flush=True,
                 )
 
-        source = self._open_stream_source(source_spec, prefetched_bytes)
-        decoder = Decoder(source)
+        source = self._open_stream_source(
+            source_spec,
+            prefetched_bytes,
+            sink=self._pcm_stream_cache_sink(
+                track_id,
+                quality,
+                source_spec,
+                duration_s,
+                stream_info,
+                track_meta,
+            ),
+        )
+        decoder = Decoder(
+            source, surround=_is_atmos_stream_info(stream_info)
+        )
 
         # Match the active stream's rate so the adopt path can take
         # the same-rate (stream-stays-open) branch. Skipped in
@@ -1750,6 +4085,15 @@ class PCMPlayer:
             if not self._force_volume:
                 self._volume = volume
             self._seq += 1
+            native = self._native
+            effective = self._volume
+        if native is not None:
+            # MediaPlayer has its own volume stage; keep it in step
+            # with the slider or the two would fight.
+            try:
+                native.set_volume(effective)
+            except Exception as exc:
+                log.warning("native atmos volume failed: %s", exc)
         return self.snapshot()
 
     def set_force_volume(self, enabled: bool) -> PlayerSnapshot:
@@ -1760,12 +4104,26 @@ class PCMPlayer:
             if self._force_volume:
                 self._volume = 100
             self._seq += 1
+            native = self._native
+            effective = self._volume
+        if native is not None:
+            try:
+                native.set_volume(effective)
+            except Exception as exc:
+                log.warning("native atmos volume failed: %s", exc)
         return self.snapshot()
 
     def set_muted(self, muted: bool) -> PlayerSnapshot:
         with self._lock:
             self._muted = bool(muted)
             self._seq += 1
+            native = self._native
+            muted_value = self._muted
+        if native is not None:
+            try:
+                native.set_muted(muted_value)
+            except Exception as exc:
+                log.warning("native atmos mute failed: %s", exc)
         return self.snapshot()
 
     def get_current_source_urls(self) -> Optional[list[str]]:
@@ -1951,17 +4309,47 @@ class PCMPlayer:
         """Current configuration + the resolved gain in dB applied
         right now. Surface for the Settings page so users can see
         whether the active stream actually has tags or fell back to
-        flat output."""
+        flat output. On the native Atmos path the number and its
+        provenance come from the helper, which is the only pipeline
+        where the offset is a measured loudness rather than a tag."""
         mode = self._replaygain_mode
         preamp = self._replaygain_preamp_db
         prevent = self._replaygain_prevent_clipping
         tags = _replaygain_tags_from(self._current_stream_info)
-        applied_db = compute_replaygain_db(tags, mode, preamp, prevent)
+        applied_db = compute_replaygain_db(
+            tags,
+            mode,
+            preamp,
+            prevent,
+            _tag_reference_shift_db(self._current_stream_info),
+        )
+        has_tag = (
+            tags.track_gain_db if mode == "track" else tags.album_gain_db
+        ) is not None
+        source = "tags" if (mode != "off" and has_tag) else "none"
+        loudness_lufs: Optional[float] = None
+        native = self._native
+        if native is not None:
+            applied_db = self._native_gain_db
+            source = self._native_gain_source
+            loudness_lufs = self._native_loudness_lufs
+        elif mode != "off" and not has_tag:
+            # PCM local file with no tags: the number comes from the
+            # local measurement, or the track is still playing flat
+            # because that scan hasn't finished yet.
+            applied_db = self._pcm_gain_db
+            source = self._pcm_gain_source
+            loudness_lufs = self._pcm_loudness_lufs
         return {
             "mode": mode,
             "preamp_db": preamp,
             "prevent_clipping": prevent,
             "applied_db": applied_db,
+            "applied_effective_db": (
+                self._native_gain_applied_db if native is not None else applied_db
+            ),
+            "source": source,
+            "loudness_lufs": loudness_lufs,
             "track_gain_db": tags.track_gain_db,
             "track_peak": tags.track_peak,
             "album_gain_db": tags.album_gain_db,
@@ -1973,9 +4361,21 @@ class PCMPlayer:
         current user mode/preamp/clipping settings. Lock-free —
         callers can be in audio-callback / lock-holding contexts
         without re-entrancy concerns. The ReplayGain instance has
-        its own internal lock for the actual coefficient swap."""
+        its own internal lock for the actual coefficient swap.
+
+        Tags are not the only source: a downloaded file carries none
+        (the downloader muxes audio only), and tags alone left such a
+        track playing at its master level — a -6 LUFS pop master
+        stayed ~10 dB louder than the same song in Apple Music. So a
+        tag-less local file is measured locally, with the same EBU
+        R128 meter the native Atmos path uses, and the offset is
+        applied once the scan lands.
+        """
         if info is None:
             self._replaygain.clear()
+            self._pcm_gain_source = "none"
+            self._pcm_gain_db = 0.0
+            self._pcm_loudness_lufs = None
             return
         tags = _replaygain_tags_from(info)
         gain_db = compute_replaygain_db(
@@ -1983,8 +4383,96 @@ class PCMPlayer:
             self._replaygain_mode,
             self._replaygain_preamp_db,
             self._replaygain_prevent_clipping,
+            _tag_reference_shift_db(info),
         )
         self._replaygain.set_gain_db(gain_db)
+        # The native pipeline has no sample buffer to multiply, so its
+        # offset lives on the helper instead. PCM and native never run
+        # together, which is what keeps this branch off the callback's
+        # path: when a helper is attached, the PCM callback is dormant.
+        helper = self._native
+        if helper is not None:
+            self._push_native_gain(helper, info)
+            return
+
+        has_tag = (
+            tags.track_gain_db
+            if self._replaygain_mode == "track"
+            else tags.album_gain_db
+        ) is not None
+        self._pcm_gain_source = (
+            "tags" if (self._replaygain_mode != "off" and has_tag) else "none"
+        )
+        self._pcm_gain_db = gain_db
+        self._pcm_loudness_lufs = None
+        if self._replaygain_mode == "off" or has_tag:
+            return
+        if info.source != "local" or not self._source_path:
+            return
+        path = self._source_path
+        measured = loudness.cached(path)
+        if measured is None:
+            # First play of this file: it stays flat until the scan
+            # finishes rather than guessing a level.
+            self._pcm_gain_source = "pending"
+            self._start_pcm_loudness_scan(path)
+            return
+        self._apply_measured_pcm_gain(path, measured)
+
+    def _start_pcm_loudness_scan(self, path: str) -> None:
+        """Measure one tag-less local file in the background. A play
+        that lands while the scan runs just waits for its result."""
+        with self._loudness_scan_lock:
+            if self._loudness_scan_path == path:
+                return
+            self._loudness_scan_path = path
+        threading.Thread(
+            target=self._scan_pcm_loudness,
+            args=(path,),
+            name="pcm-loudness-scan",
+            daemon=True,
+        ).start()
+
+    def _scan_pcm_loudness(self, path: str) -> None:
+        try:
+            measured = loudness.analyze(path)
+        finally:
+            with self._loudness_scan_lock:
+                if self._loudness_scan_path == path:
+                    self._loudness_scan_path = None
+        if measured:
+            self._apply_measured_pcm_gain(path, measured)
+
+    def _apply_measured_pcm_gain(self, path: str, measured: dict) -> None:
+        """Apply a measured offset when `path` is still what's playing.
+        The measurement is asynchronous, so the queue may have moved on
+        by the time it lands."""
+        if self._source_path != path or self._replaygain_mode == "off":
+            return
+        lufs = measured.get("lufs")
+        if not isinstance(lufs, (int, float)):
+            self._pcm_gain_source = "none"
+            return
+        gain_db = compute_measured_gain_db(
+            float(lufs),
+            measured.get("peak"),
+            loudness.TARGET_LUFS,
+            self._replaygain_preamp_db,
+            self._replaygain_prevent_clipping,
+        )
+        self._replaygain.set_gain_db(gain_db)
+        self._pcm_gain_source = "measured"
+        self._pcm_gain_db = gain_db
+        self._pcm_loudness_lufs = float(lufs)
+        try:
+            log.info(
+                "loudness leveling: measured %.1f LUFS -> %+.1f dB (PCM, %s)",
+                float(lufs),
+                gain_db,
+                os.path.basename(path),
+            )
+        except Exception:
+            pass
 
     def equalizer_bypass(self) -> bool:
         """Read the current bypass flag — server uses it to expose
@@ -2159,10 +4647,7 @@ class PCMPlayer:
                     current_stream.stop()
                 except Exception:
                     pass
-                try:
-                    current_stream.close()
-                except Exception:
-                    pass
+                _close_pa_stream(current_stream)
                 with self._lock:
                     self._stream = None
                     # Reset the callback's mid-frame carry so the
@@ -2214,10 +4699,7 @@ class PCMPlayer:
                     current_stream.stop()
                 except Exception:
                     pass
-                try:
-                    current_stream.close()
-                except Exception:
-                    pass
+                _close_pa_stream(current_stream)
                 with self._lock:
                     self._stream = None
                     self._callback_carry = None
@@ -2247,6 +4729,13 @@ class PCMPlayer:
                     renderer_ms = None
             if renderer_ms is not None:
                 pos_ms = renderer_ms
+            elif self._native is not None:
+                pos_ms = self._native_pos_ms
+                if (
+                    self._native_playback_state == "Playing"
+                    and self._state == "playing"
+                ):
+                    pos_ms += int((time.monotonic() - self._native_pos_at) * 1000)
             elif self._stream_sample_rate and self._samples_emitted > 0:
                 pos_ms = int(
                     self._samples_emitted * 1000 / self._stream_sample_rate
@@ -2264,8 +4753,19 @@ class PCMPlayer:
                 volume=self._volume,
                 muted=self._muted,
                 error=self._last_error,
+                error_kind=(
+                    "backoff"
+                    if self._last_error and _tidal_backoff_active()
+                    else None
+                ),
                 seq=self._seq,
                 stream_info=self._current_stream_info,
+                immersive=_dolby_playback_kind(
+                    self._current_stream_info,
+                    native=self._native is not None,
+                    spatial_format=self._native_spatial_format,
+                    decoders=self._native_decoders,
+                ),
                 force_volume=self._force_volume,
             )
 
@@ -2329,22 +4829,82 @@ class PCMPlayer:
             return
         self._retire_pipeline(pre.stop_flag, pre.decoder, pre.thread)
 
-    def _teardown(self) -> None:
+    def _teardown(
+        self,
+        *,
+        keep_native: bool = False,
+        park_native: bool = False,
+        keep_dash: Optional[_DashAtmos] = None,
+    ) -> Optional[NativeAtmosPlayer]:
         """Stop the pipeline fully. State transitions to idle BEFORE
         we close the stream, so the finished_callback short-circuits
         and doesn't emit a spurious 'ended' at user-initiated stops.
         Any preload is also dropped — a stale preload on a
         user-stopped pipeline would fire a bogus bridge when the
         next load() came in.
+
+        `keep_native` hands the live helper back instead of closing
+        it, paused. Spawning the PowerShell host and standing up
+        MediaPlayer costs ~0.4-0.6 s (measured), which is pure
+        overhead on an Atmos -> Atmos track change: the next track
+        only needs `Source` pointed at a new file. The caller owns
+        the returned helper and must either reuse it or close it.
+
+        `park_native` is the mixed-queue counterpart: the outgoing
+        helper is left idle in the warm slot instead of being shut
+        down, so an Atmos -> PCM -> Atmos sequence spawns once, not
+        twice. Only the process is kept — nothing audible.
+
+        `keep_dash` likewise spares the one session feeding the track
+        that is about to open; every other stream — including a
+        look-ahead download for a track that is no longer next — is
+        retired here, because its track is the one being torn down.
         """
         # Drop preload first so finished_callback's `pre` read sees
         # None when it fires during stream.close() below.
         self._drop_preload()
         self._pending_upnp_notify = False
+        self._retire_dash_sessions(keep=keep_dash)
+        if keep_native or park_native:
+            # Both keep the idle helper: `keep_native` is about to adopt
+            # the warmed look-ahead, `park_native` is handing the queue
+            # to PCM. Only one that sat past its TTL — the same helper
+            # `_take_warm_helper` would refuse — is closed.
+            self._reap_idle_helper()
+        else:
+            # A stop leaves nothing for the warmed look-ahead to play.
+            self._close_warm_helper()
+        reuse: Optional[NativeAtmosPlayer] = None
+        native, native_stop = self._clear_native_locked()
+        if native is not None:
+            keep = False
+            if keep_native and getattr(native, "running", False):
+                # Silence the outgoing track before the caller spends
+                # time resolving the next one; assigning `Source`
+                # later stops playback anyway, this just gets there
+                # first and is cheap.
+                try:
+                    native.pause()
+                except Exception as exc:
+                    log.warning("native atmos pause on teardown failed: %s", exc)
+                reuse = native
+                keep = True
+            elif park_native:
+                keep = self._park_native_helper(native)
+            if not keep:
+                # Closing blocks briefly on the helper's quit handshake;
+                # do it before touching the sounddevice stream so a native
+                # track can't bleed into the next PCM track's open.
+                try:
+                    native.close()
+                except Exception:
+                    pass
+        if native_stop is not None:
+            native_stop.set()
         with self._lock:
             # If we're already idle, nothing to do.
             if self._state == "idle" and self._stream is None:
-                return
+                return reuse
             self._state = "idle"
             self._seq += 1
 
@@ -2373,14 +4933,7 @@ class PCMPlayer:
             # gets cut off, which is what the user already expects
             # when clicking a new track.
             t_abort0 = time.monotonic()
-            try:
-                stream.abort()
-            except Exception:
-                pass
-            try:
-                stream.close()
-            except Exception:
-                pass
+            _close_pa_stream(stream)
             print(
                 f"[perf] teardown stream.abort+close="
                 f"{(time.monotonic() - t_abort0) * 1000.0:.0f}ms",
@@ -2431,6 +4984,7 @@ class PCMPlayer:
             self._current_track_meta = None
             self._paused = False
             self._seeking = False
+        return reuse
 
     def _build_track_meta(self, track, duration_s) -> dict:
         """Extract UPnP/DLNA track metadata from a resolved Tidal track.
@@ -2522,117 +5076,359 @@ class PCMPlayer:
             except Exception:
                 pass
 
-        cache_key = (track_id, quality)
+        # Finished file from a previous play: open it directly. This
+        # skips the TIDAL round-trips and the download, and a real
+        # file seeks precisely. Skipped while casting (the renderer
+        # plays TIDAL URLs, not local files) and for Atmos, which has
+        # the native pipeline's own cache.
         t0 = time.monotonic()
-        joined = False
-        while True:
-            hit = self._cached_source(
-                cache_key, t0, set_current_meta, joined=joined
+        if (
+            quality
+            and quality.lower() != "atmos"
+            and not (
+                _upnp_manager is not None and _upnp_manager.is_active()
             )
-            if hit is not None:
-                return hit
-            in_flight = self._manifest_cache.begin_fill(cache_key)
-            if in_flight is None:
-                break
-            # Another thread is already asking Tidal for this exact
-            # track at this quality: typically the hover warm-up for the
-            # row just clicked, or the preload of the track just skipped
-            # to. Its answer lands in the cache, so wait for it rather
-            # than paying a second, parallel resolve. If it failed, the
-            # loop finds the cache still empty and resolves here. The
-            # owner's own resolve is bounded by _RESOLVE_TIMEOUT_S, and
-            # so is this wait.
-            in_flight.wait(timeout=_RESOLVE_TIMEOUT_S)
-            joined = True
+        ):
+            disk_hit = self._pcm_stream_cache_lookup(track_id, quality)
+            if disk_hit is not None and not _cached_tier_is_usable(
+                quality, disk_hit[2]
+            ):
+                log.info(
+                    "ignoring %s disk-cache entry for %s: it holds a "
+                    "lossy stream under a lossless key",
+                    quality,
+                    track_id,
+                )
+                disk_hit = None
+            if disk_hit is not None:
+                path, duration_s, info, meta = disk_hit
+                if meta is not None and set_current_meta:
+                    self._current_track_meta = meta
+                print(
+                    f"[perf] resolve track={track_id} quality={quality} "
+                    f"cache=DISK elapsed="
+                    f"{(time.monotonic() - t0) * 1000.0:.0f}ms "
+                    f"prefetched_segments=0",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return path, duration_s, info, {}, meta
+
+        # Cache hit path: skip the two parallel Tidal round-trips
+        # (track metadata + playbackinfo) plus the local manifest
+        # parse when a recent prefetch or play already resolved this
+        # (track_id, quality) pair. 3-minute TTL stays well inside
+        # Tidal's signed-URL expiry window.
+        cache_key = (track_id, quality)
+        cached_urls_info = self._manifest_cache.lookup(cache_key)
+        if cached_urls_info is not None and not _cached_tier_is_usable(
+            quality, cached_urls_info[2]
+        ):
+            cached_urls_info = None
+        if cached_urls_info is not None:
+            return self._resolved_from_cache(
+                cached_urls_info, track_id, quality, t0, set_current_meta, "HIT"
+            )
+        # A hover prefetch is often still resolving this exact track
+        # when the click lands. Joining that resolve is what makes a
+        # quick hover-then-click fast: the click waits out the tail of
+        # work already in flight instead of repeating the same Tidal
+        # round-trips from scratch and paying them twice over.
+        ticket, leader = self._claim_resolve(cache_key)
+        if not leader:
+            ticket.event.wait(_RESOLVE_JOIN_S)
+            cached_urls_info = self._manifest_cache.lookup(cache_key)
+            if cached_urls_info is not None and not _cached_tier_is_usable(
+                quality, cached_urls_info[2]
+            ):
+                cached_urls_info = None
+            if cached_urls_info is not None:
+                return self._resolved_from_cache(
+                    cached_urls_info, track_id, quality, t0, set_current_meta, "JOIN"
+                )
+            if ticket.result is not None:
+                spec, duration, info, bytes_map, track_meta = ticket.result
+                if track_meta is not None and set_current_meta:
+                    self._current_track_meta = track_meta
+                return (spec, duration, info, dict(bytes_map), track_meta)
+            # A failed or evicted leader leaves no answer behind. Claim
+            # the key again so this caller retries instead of inheriting
+            # a transient failure from the hover or preload it joined.
+            ticket, leader = self._claim_resolve(cache_key)
 
         try:
-            # A fill can complete between the miss above and our claim.
-            hit = self._cached_source(
-                cache_key, t0, set_current_meta, joined=joined
-            )
-            if hit is not None:
-                return hit
-            return self._resolve_uncached(
+            result = self._resolve_miss(
                 session, track_id, quality, cache_key, t0,
                 set_current_meta=set_current_meta,
             )
-        except Exception as exc:
-            # The playback resolve path must recover from an expired
-            # Tidal token exactly like the download and metadata
-            # paths already do. Without this, a stale access token
-            # surfaces as a silent "press play, nothing happens":
-            # the 401 propagates, the player flips to error, and the
-            # user is neither refreshed nor bounced to Login.
-            # getattr (not self._force_refresh) because some unit
-            # tests build PCMPlayer via __new__ and never run
-            # __init__; a missing injector just means "no refresh".
-            force_refresh = getattr(self, "_force_refresh", None)
-            if force_refresh is not None and _looks_like_auth_error(exc):
-                if force_refresh():
-                    log.info(
-                        "playback resolve hit a Tidal auth error; "
-                        "token refreshed, retrying once"
-                    )
-                    return self._resolve_uncached(
-                        self._session_getter(),
-                        track_id,
-                        quality,
-                        cache_key,
-                        t0,
-                        set_current_meta=set_current_meta,
-                    )
-                raise RuntimeError(
-                    "Tidal session expired. Please log out and log "
-                    "back in."
-                ) from exc
+        except BaseException as exc:
+            self._release_resolve(
+                cache_key, ticket if leader else None, error=exc
+            )
             raise
-        finally:
-            self._manifest_cache.end_fill(cache_key)
+        self._release_resolve(cache_key, ticket if leader else None, result=result)
+        return result
 
-    def _cached_source(
+    def _resolved_from_cache(
         self,
-        cache_key: tuple,
+        entry: tuple,
+        track_id: str,
+        quality: Optional[str],
         t0: float,
         set_current_meta: bool,
-        *,
-        joined: bool,
-    ) -> Optional[
-        tuple[list[str], Optional[float], StreamInfo, dict[int, bytes], Optional[dict]]
-    ]:
-        """The cache-hit half of _resolve_source, or None on a miss.
+        label: str,
+    ) -> tuple[Union[str, list[str]], Optional[float], StreamInfo, dict[int, bytes], Optional[dict]]:
+        """Return a cached resolve, refreshing the UPnP metadata.
 
-        Skips the two parallel Tidal round-trips (track metadata +
-        playbackinfo) plus the local manifest parse when a recent
-        prefetch or play already resolved this (track_id, quality)
-        pair. 3-minute TTL stays well inside Tidal's signed-URL expiry
-        window. `joined` marks a hit that came from waiting on another
-        thread's resolve, so the perf line doesn't pass the wait off as
-        a plain cache hit.
+        The miss path sets `_current_track_meta` as part of resolving;
+        a hit used to leave it pointing at the previous track, so the
+        renderer was told the wrong artist/song at session start (and
+        on every replay, since a prefetch makes the first play a hit).
+        Guarded by `set_current_meta` so speculative prefetch does not
+        clobber it.
         """
-        cached_urls_info = self._manifest_cache.lookup(cache_key)
-        if cached_urls_info is None:
-            return None
-        urls, duration, info, bytes_map, track_meta = cached_urls_info
-        # Cache HIT must refresh the UPnP metadata for playback too
-        # — the miss path does this inside _resolve_uncached, but a
-        # hit used to leave _current_track_meta pointing at the
-        # previous track, so the renderer was told the wrong
-        # artist/song at session start (and on every replay, since
-        # cold-start prefetch makes the first play a hit). Guarded
-        # by set_current_meta so speculative prefetch doesn't clobber
-        # it.
+        urls, duration, info, bytes_map, track_meta = entry
         if track_meta is not None and set_current_meta:
             self._current_track_meta = track_meta
-        track_id, quality = cache_key
         print(
             f"[perf] resolve track={track_id} quality={quality} "
-            f"cache={'JOINED' if joined else 'HIT'} "
-            f"elapsed={(time.monotonic() - t0) * 1000.0:.0f}ms "
+            f"cache={label} elapsed={(time.monotonic() - t0) * 1000.0:.0f}ms "
             f"prefetched_segments={len(bytes_map)}",
             file=sys.stderr,
             flush=True,
         )
         return (list(urls), duration, info, bytes_map, track_meta)
+
+    def _pcm_stream_cache_lookup(
+        self, track_id: str, quality: Optional[str]
+    ) -> Optional[tuple[str, Optional[float], StreamInfo, Optional[dict]]]:
+        """A finished file for this (track, quality), or None.
+
+        The caller has already excluded Atmos and cast sessions; this
+        is only about reading the sidecar back into a StreamInfo.
+        """
+        cache = getattr(self, "_pcm_stream_cache", None)
+        if cache is None:
+            return None
+        try:
+            hit = cache.lookup(track_id, quality)
+        except OSError:
+            return None
+        if hit is None:
+            return None
+        path, duration_s, payload, meta = hit
+        try:
+            info = StreamInfo(**payload)
+        except TypeError:
+            # Written by a build whose StreamInfo had different
+            # fields; treat it as a miss and download again.
+            return None
+        return path, duration_s, info, meta
+
+    def _pcm_stream_cache_sink(
+        self,
+        track_id: str,
+        quality: Optional[str],
+        spec: Union[str, list[str]],
+        duration_s: Optional[float],
+        info: StreamInfo,
+        meta: Optional[dict],
+    ) -> Optional[object]:
+        """A disk-cache tee for this play's segments, or None.
+
+        Caching applies only to a real TIDAL stream at a concrete
+        quality. A local file is already on disk, Atmos has its own
+        cache, a cast session hands the renderer TIDAL URLs (so the
+        local decoder is not what fetches the track), and a
+        quality-less request's effective tier is unknown until the
+        manifest arrives — keying on it could serve the wrong tier.
+        """
+        if not isinstance(spec, list) or not quality:
+            return None
+        if quality.lower() == "atmos":
+            return None
+        if _upnp_manager is not None and _upnp_manager.is_active():
+            return None
+        cache = getattr(self, "_pcm_stream_cache", None)
+        if cache is None:
+            return None
+        try:
+            return cache.sink(
+                track_id,
+                quality,
+                len(spec),
+                duration_s,
+                asdict(info),
+                meta,
+            )
+        except OSError:
+            return None
+
+    def _claim_resolve(self, cache_key: tuple) -> tuple[Optional["_ResolveTicket"], bool]:
+        """Register interest in a resolve, or find one to wait on.
+
+        Returns (ticket, is_leader). A player built without `__init__`
+        (unit tests) has no registry: every caller is its own leader.
+        """
+        lock = getattr(self, "_resolving_lock", None)
+        if lock is None:
+            return None, True
+        with lock:
+            ticket = self._resolving.get(cache_key)
+            if ticket is not None:
+                return ticket, False
+            ticket = _ResolveTicket()
+            self._resolving[cache_key] = ticket
+            return ticket, True
+
+    def _release_resolve(
+        self,
+        cache_key: tuple,
+        ticket: Optional["_ResolveTicket"],
+        *,
+        result: Optional[tuple] = None,
+        error: Optional[BaseException] = None,
+    ) -> None:
+        """Publish a resolve's outcome and wake the threads waiting on it."""
+        if ticket is None:
+            return
+        ticket.result = result
+        ticket.error = error
+        with self._resolving_lock:
+            if self._resolving.get(cache_key) is ticket:
+                self._resolving.pop(cache_key, None)
+        ticket.event.set()
+
+    def _resolve_miss(
+        self,
+        session: tidalapi.Session,
+        track_id: str,
+        quality: Optional[str],
+        cache_key: tuple,
+        t0: float,
+        *,
+        set_current_meta: bool = True,
+        _refreshed: bool = False,
+    ) -> tuple[Union[str, list[str]], Optional[float], StreamInfo, dict[int, bytes], Optional[dict]]:
+        try:
+            return self._resolve_uncached(
+                session, track_id, quality, cache_key, t0,
+                set_current_meta=set_current_meta,
+            )
+        except atmos_mod.AtmosUnavailable as exc:
+            # The user asked for Atmos but this release has no E-AC-3 JOC
+            # asset (or the manifest was unusable). Fall back to the best
+            # lossless tier instead of failing the play outright — the
+            # now-playing pill reports the quality that's actually
+            # audible, so the downgrade is visible, not silent-but-wrong.
+            log.info(
+                "Dolby Atmos unavailable for track %s (%s); falling back "
+                "to hi_res_lossless",
+                track_id,
+                exc,
+            )
+            fallback_quality = "hi_res_lossless"
+            if self._quality_clamp is not None:
+                try:
+                    clamped = self._quality_clamp(fallback_quality)
+                    if clamped:
+                        fallback_quality = clamped
+                except Exception:
+                    pass
+            fallback_key = (track_id, fallback_quality)
+            cached = self._manifest_cache.lookup(fallback_key)
+            if cached is not None and not _cached_tier_is_usable(
+                fallback_quality, cached[2]
+            ):
+                cached = None
+            if cached is not None:
+                urls, duration, info, bytes_map, track_meta = cached
+                if track_meta is not None and set_current_meta:
+                    self._current_track_meta = track_meta
+                return (list(urls), duration, info, bytes_map, track_meta)
+            try:
+                return self._resolve_uncached(
+                    session,
+                    track_id,
+                    fallback_quality,
+                    fallback_key,
+                    t0,
+                    set_current_meta=set_current_meta,
+                )
+            except Exception as fallback_exc:
+                # An error raised *inside* this handler would otherwise
+                # skip the auth-retry below — sibling `except` clauses
+                # never see it. Expired-token 401s on the lossless
+                # fallback need the same refresh-and-retry treatment as
+                # a direct resolve, which is why the original quality
+                # (not the fallback) is retried: the refreshed session
+                # may well be entitled to Atmos.
+                return self._retry_after_auth_error(
+                    fallback_exc,
+                    track_id,
+                    quality,
+                    cache_key,
+                    t0,
+                    set_current_meta,
+                    _refreshed,
+                )
+        except Exception as exc:
+            return self._retry_after_auth_error(
+                exc,
+                track_id,
+                quality,
+                cache_key,
+                t0,
+                set_current_meta,
+                _refreshed,
+            )
+
+    def _retry_after_auth_error(
+        self,
+        exc: BaseException,
+        track_id: str,
+        quality: Optional[str],
+        cache_key: tuple,
+        t0: float,
+        set_current_meta: bool,
+        refreshed: bool,
+    ) -> tuple[Union[str, list[str]], Optional[float], StreamInfo, dict[int, bytes], Optional[dict]]:
+        """Refresh an expired Tidal token once and redo the resolve.
+
+        The playback resolve path must recover from an expired token
+        exactly like the download and metadata paths already do.
+        Without this, a stale access token surfaces as a silent "press
+        play, nothing happens": the 401 propagates, the player flips to
+        error, and the user is neither refreshed nor bounced to Login.
+
+        `getattr` (not `self._force_refresh`) because some unit tests
+        build PCMPlayer via `__new__` and never run `__init__`; a
+        missing injector just means "no refresh".
+        """
+        force_refresh = getattr(self, "_force_refresh", None)
+        if (
+            not refreshed
+            and force_refresh is not None
+            and _looks_like_auth_error(exc)
+        ):
+            if force_refresh():
+                log.info(
+                    "playback resolve hit a Tidal auth error; "
+                    "token refreshed, retrying once"
+                )
+                return self._resolve_miss(
+                    self._session_getter(),
+                    track_id,
+                    quality,
+                    cache_key,
+                    t0,
+                    set_current_meta=set_current_meta,
+                    _refreshed=True,
+                )
+            raise RuntimeError(
+                "Tidal session expired. Please log out and log back in."
+            ) from exc
+        raise exc
 
     def _resolve_uncached(
         self,
@@ -2654,6 +5450,15 @@ class PCMPlayer:
         `set_current_meta` mirrors _resolve_source: speculative
         resolution (prefetch) passes False so it doesn't overwrite the
         metadata of the track that is actually playing."""
+        if (quality or "").lower() == "atmos":
+            # Atmos is not a tidalapi.Quality member; it has its own
+            # OpenAPI manifest path. Handle it before the v1 quality
+            # override so we never set session.config.quality to a
+            # nonexistent tier.
+            return self._resolve_atmos(
+                session, track_id, cache_key, t0,
+                set_current_meta=set_current_meta,
+            )
         override = None
         if quality:
             try:
@@ -2682,15 +5487,26 @@ class PCMPlayer:
             # transport timeout (app.http.DEFAULT_TIMEOUT) ensures the
             # orphaned worker actually unwinds shortly after instead
             # of lingering.
+            # Shared with the downloader: TIDAL's legacy /urlpostpaywall
+            # path (and the LOSSLESS tier itself, on some clients)
+            # silently answers AAC 320 even for a lossless request, so
+            # resolution has to inspect the delivered tier and escalate
+            # to HI_RES when that's what it takes to get FLAC.
+            from app.tidal_client import request_stream_manifest
+
             ex = ThreadPoolExecutor(max_workers=2)
             try:
                 track_future = ex.submit(session.track, tid)
                 stream_holder = tidalapi.Track(session)
                 stream_holder.id = tid
-                stream_future = ex.submit(stream_holder.get_stream)
+                stream_future = ex.submit(
+                    request_stream_manifest, session, stream_holder
+                )
+                deadline = time.monotonic() + _RESOLVE_TIMEOUT_S
                 try:
-                    track = track_future.result(timeout=_RESOLVE_TIMEOUT_S)
-                    stream = stream_future.result(timeout=_RESOLVE_TIMEOUT_S)
+                    stream, manifest, delivered = stream_future.result(
+                        timeout=_RESOLVE_TIMEOUT_S
+                    )
                 except FutureTimeoutError:
                     # Surfaces to _load_locked's except: it flips the
                     # player to state=error and emits, so the frontend
@@ -2701,24 +5517,44 @@ class PCMPlayer:
                         "Tidal did not respond while resolving the "
                         "track (timed out)"
                     )
+                try:
+                    track = track_future.result(
+                        timeout=max(0.0, deadline - time.monotonic())
+                    )
+                except Exception as exc:  # noqa: BLE001 - metadata is optional
+                    # The playback service is authoritative: ids that
+                    # exist only in the v2 catalog (or that the v1
+                    # catalog dropped) 404 on `tracks/{id}` while still
+                    # streaming fine. Failing the whole play here is
+                    # what made a previously cached track unplayable
+                    # once its cache was deleted.
+                    log.info(
+                        "track metadata unavailable for %s (%s); "
+                        "playing without it",
+                        track_id,
+                        exc,
+                    )
+                    track = None
             finally:
                 ex.shutdown(wait=False, cancel_futures=True)
-            t_after_network = time.monotonic()
-            manifest = stream.get_stream_manifest()
             t_end = time.monotonic()
             if getattr(manifest, "is_encrypted", False):
                 raise RuntimeError("encrypted stream — can't decode")
             urls = list(getattr(manifest, "urls", []) or [])
             if not urls:
                 raise RuntimeError("manifest has no segment urls")
-            duration = getattr(track, "duration", None)
+            duration = getattr(track, "duration", None) if track is not None else None
             # Resolve track metadata for UPnP/DLNA track-change
             # notification. Also stored on the cache entry (below) so a
             # later cache HIT carries the correct metadata too. Only for
             # real loads — speculative prefetch passes set_current_meta
             # False so it can't clobber the playing track's metadata.
-            track_meta = self._build_track_meta(track, duration)
-            if set_current_meta:
+            track_meta = (
+                self._build_track_meta(track, duration)
+                if track is not None
+                else None
+            )
+            if track_meta is not None and set_current_meta:
                 self._current_track_meta = track_meta
             info = StreamInfo(
                 source="stream",
@@ -2761,8 +5597,8 @@ class PCMPlayer:
             print(
                 f"[perf] resolve track={track_id} quality={quality} cache=MISS "
                 f"total={(t_end - t0) * 1000.0:.0f}ms "
-                f"network_parallel={(t_after_network - t_start) * 1000.0:.0f}ms "
-                f"manifest_parse={(t_end - t_after_network) * 1000.0:.0f}ms "
+                f"network_parallel={(t_end - t_start) * 1000.0:.0f}ms "
+                f"delivered={delivered} "
                 f"segments={len(urls)}",
                 file=sys.stderr,
                 flush=True,
@@ -2772,11 +5608,88 @@ class PCMPlayer:
             if override is not None:
                 session.config.quality = original
 
+    def _resolve_atmos(
+        self,
+        session: tidalapi.Session,
+        track_id: str,
+        cache_key: tuple,
+        t0: float,
+        *,
+        set_current_meta: bool = True,
+    ) -> tuple[
+        list[str], Optional[float], StreamInfo, dict[int, bytes], Optional[dict]
+    ]:
+        """Resolve the Dolby Atmos (E-AC-3 JOC) asset for `track_id`.
+
+        Runs the whole catalog dance — metadata, twin lookup, OpenAPI
+        manifest, DASH expansion — on one worker thread so a hung Tidal
+        request is bounded by `_RESOLVE_TIMEOUT_S` rather than pinning
+        the pipeline lock. Raises `AtmosUnavailable` when this release
+        has no Atmos asset; `_resolve_source` turns that into a lossless
+        fallback.
+        """
+        tid = int(track_id)
+        ex = ThreadPoolExecutor(max_workers=1)
+        try:
+            future = ex.submit(atmos_mod.resolve_atmos_playback, session, tid)
+            try:
+                track, stream = future.result(timeout=_RESOLVE_TIMEOUT_S)
+            except FutureTimeoutError:
+                raise RuntimeError(
+                    "Tidal did not respond while resolving the Dolby "
+                    "Atmos stream (timed out)"
+                )
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
+
+        # The resolver reports None when Tidal's v1 catalog doesn't know
+        # the id even though the manifest service serves the stream;
+        # duration and renderer metadata are then simply unknown.
+        duration = getattr(track, "duration", None) if track is not None else None
+        track_meta = (
+            self._build_track_meta(track, duration) if track is not None else None
+        )
+        if track_meta is not None and set_current_meta:
+            self._current_track_meta = track_meta
+
+        info = StreamInfo(
+            source="stream",
+            codec=_normalize_codec(stream.codec) or "eac3",
+            bit_depth=stream.bit_depth,
+            sample_rate_hz=stream.sample_rate,
+            audio_quality="DOLBY_ATMOS",
+            audio_mode="DOLBY_ATMOS",
+            track_replay_gain_db=stream.track_replay_gain,
+            track_peak=stream.track_peak,
+            album_replay_gain_db=stream.album_replay_gain,
+            album_peak=stream.album_peak,
+        )
+        duration_s = float(duration) if duration else None
+        self._manifest_cache.store(
+            cache_key, list(stream.urls), duration_s, info, track_meta
+        )
+        cached = self._manifest_cache.lookup(cache_key)
+        bytes_map = cached[3] if cached is not None else {}
+        print(
+            f"[perf] resolve track={track_id} quality=atmos cache=MISS "
+            f"total={(time.monotonic() - t0) * 1000.0:.0f}ms "
+            f"segments={len(stream.urls)} channels={stream.channels} "
+            f"rate={stream.sample_rate}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return (list(stream.urls), duration_s, info, bytes_map, track_meta)
+
     def cache_stats(self) -> dict:
         """Snapshot of the manifest cache for the /api/player/cache-stats
         endpoint. Read while testing the prefetch path to confirm
-        hovers / album-mount prefetches are landing."""
-        return self._manifest_cache.stats()
+        hovers / album-mount prefetches are landing. `stream` is the
+        on-disk cache of completed non-Atmos tracks."""
+        try:
+            stream = self._pcm_stream_cache.stats()
+        except Exception as exc:  # cache stats must never break the endpoint
+            stream = {"error": str(exc)}
+        return {**self._manifest_cache.stats(), "stream": stream}
 
     def prefetch(
         self, track_id: str, quality: Optional[str] = None, *, warm_bytes: bool = True
@@ -2835,36 +5748,100 @@ class PCMPlayer:
         in parallel. Skips segments already in the cache so repeat
         hover events don't re-download. Fire-and-forget: any failure
         leaves the cache at URL-only and the eventual play path
-        falls through to the normal SegmentReader fetch."""
+        falls through to the normal SegmentReader fetch.
+
+        A single-URL source is one whole progressive file (the AAC
+        tiers), so warming it used to download every byte of the
+        track — albums warm on mount, which meant a page open pulled
+        tens of MB and starved the audio callback. Only a bounded
+        header prefix is fetched for those; SegmentReader continues
+        the rest from where the seed ends when the track is played.
+
+        The fetches are also registered under `key` so a click that
+        lands mid-download takes these bytes (`_adopt_warm_bytes`)
+        instead of pulling the same segment a second time on the
+        critical path. Each segment is published to the cache as soon
+        as it lands, so an early click gets whatever is already in."""
         cached = self._manifest_cache.lookup(key)
         have = cached[3] if cached is not None else {}
         targets = [i for i in (0, 1) if i < len(urls) and i not in have]
         if not targets:
             return
         fetched: dict[int, bytes] = {}
+        single = len(urls) == 1
 
         def _fetch(i: int) -> Optional[tuple[int, bytes]]:
             try:
                 # The playback reader's pool, so warming a track also
                 # leaves a live CDN connection for the click to reuse.
-                r = STREAM_SESSION.get(urls[i], timeout=30)
-                r.raise_for_status()
-                return i, r.content
+                headers = (
+                    {"Range": f"bytes=0-{_WARM_HEAD_BYTES - 1}"}
+                    if single
+                    else None
+                )
+                r = STREAM_SESSION.get(
+                    urls[i],
+                    timeout=30,
+                    headers=headers,
+                    stream=single,
+                )
+                try:
+                    r.raise_for_status()
+                    if not single:
+                        return i, r.content
+                    # A CDN that ignores Range answers 200 with the
+                    # whole body; keep only the prefix we asked for.
+                    chunks: list[bytes] = []
+                    got = 0
+                    for chunk in r.iter_content(chunk_size=65536):
+                        if not chunk:
+                            continue
+                        chunks.append(chunk)
+                        got += len(chunk)
+                        if got >= _WARM_HEAD_BYTES:
+                            break
+                    return i, b"".join(chunks)[:_WARM_HEAD_BYTES]
+                finally:
+                    try:
+                        r.close()
+                    except Exception:
+                        pass
             except Exception as exc:
                 log.debug("prefetch bytes seg=%d failed: %s", i, exc)
                 return None
 
+        lock = getattr(self, "_warm_lock", None)
         with ThreadPoolExecutor(
             max_workers=min(2, len(targets)),
             thread_name_prefix="warm-bytes",
         ) as pool:
-            for result in pool.map(_fetch, targets):
-                if result is not None:
+            futures = {i: pool.submit(_fetch, i) for i in targets}
+            if lock is not None:
+                with lock:
+                    self._warm_inflight.setdefault(key, {}).update(futures)
+            try:
+                for i, future in futures.items():
+                    result = future.result()
+                    if result is None:
+                        continue
                     idx, content = result
                     fetched[idx] = content
+                    self._manifest_cache.update_bytes(key, {idx: content})
+            finally:
+                if lock is not None:
+                    with lock:
+                        pending = self._warm_inflight.get(key)
+                        if pending is not None:
+                            for i, future in futures.items():
+                                # Identity, not index: a later hover may
+                                # have registered its own fetch for the
+                                # same segment by now.
+                                if pending.get(i) is future:
+                                    pending.pop(i, None)
+                            if not pending:
+                                self._warm_inflight.pop(key, None)
         if fetched:
             total = sum(len(v) for v in fetched.values())
-            self._manifest_cache.update_bytes(key, fetched)
             print(
                 f"[perf] prefetch bytes track={key[0]} quality={key[1]} "
                 f"segments={sorted(fetched.keys())} "
@@ -2882,7 +5859,55 @@ class PCMPlayer:
         ensure_com_initialized()
         stream.start()
 
-    def _open_output_stream(self, sample_rate: int, channels: int, dtype: str) -> None:
+    def _adopt_warm_bytes(
+        self,
+        key: tuple[str, Optional[str]],
+        prefetched: Optional[dict[int, bytes]],
+    ) -> Optional[dict[int, bytes]]:
+        """Take the bytes a hover prefetch is downloading right now.
+
+        A click that arrives while the prefetch's init/first-segment
+        fetches are in flight used to start a second download of the
+        same segment for the DASH prime, and the two competed for the
+        same connection. Waiting out the prefetch's remaining bytes is
+        both faster and smaller: the prime then starts with the
+        segments already in hand.
+        """
+        lock = getattr(self, "_warm_lock", None)
+        if lock is None:
+            return prefetched
+        with lock:
+            pending = dict(self._warm_inflight.get(key) or {})
+        if not pending:
+            return prefetched
+        merged = dict(prefetched or {})
+        deadline = time.monotonic() + _WARM_BYTES_JOIN_S
+        for index, future in pending.items():
+            if index in merged:
+                continue
+            try:
+                result = future.result(
+                    timeout=max(0.0, deadline - time.monotonic())
+                )
+            except Exception:
+                continue
+            if result:
+                merged[result[0]] = result[1]
+        return merged
+
+    @staticmethod
+    def _pa_open_stream(stream_kwargs: dict) -> "sd.OutputStream":
+        """Open an OutputStream through pa_guard so its handle is
+        tracked for teardown and reinit decisions."""
+        return pa_guard.open_stream(**stream_kwargs)
+
+    def _open_output_stream(
+        self,
+        sample_rate: int,
+        channels: int,
+        dtype: str,
+        device_override: Optional[int] = None,
+    ) -> None:
         # If the user picked a specific output device, resolve its
         # saved name to a live PortAudio index; otherwise device=None
         # routes to the system default. When the chosen device is no
@@ -2891,14 +5916,22 @@ class PCMPlayer:
         # the default instead of hard-failing the load. Issue #245 was
         # a drifted index landing on an input-only device, where
         # sd.OutputStream raised "Invalid number of channels".
-        device, available = resolve_output_device(self._selected_device_id)
-        if self._selected_device_id and not available:
-            print(
-                f"[audio] saved output device "
-                f"{self._selected_device_id!r} is not available; "
-                "falling back to system default",
-                flush=True,
-            )
+        #
+        # `device_override` pins one enumeration entry for recovery:
+        # the same physical endpoint is exposed through several host
+        # APIs and they fail independently, so a retry may need to
+        # open the MME copy instead of the WASAPI one the picker shows.
+        if device_override is not None:
+            device: Optional[int] = device_override
+        else:
+            device, available = resolve_output_device(self._selected_device_id)
+            if self._selected_device_id and not available:
+                print(
+                    f"[audio] saved output device "
+                    f"{self._selected_device_id!r} is not available; "
+                    "falling back to system default",
+                    flush=True,
+                )
 
         # Decide the rate we'll actually feed sounddevice.
         # ─ Exclusive Mode: push the source rate straight at the device.
@@ -2913,6 +5946,7 @@ class PCMPlayer:
         #   device), set_target_rate is a no-op and we stay bit-perfect
         #   even in shared mode.
         decoder = self._decoder
+        device_max: Optional[int] = None
         if decoder is not None:
             if self._exclusive_mode:
                 target_rate = decoder.sample_rate
@@ -2925,6 +5959,95 @@ class PCMPlayer:
             sample_rate = decoder.output_sample_rate
             dtype = decoder.sounddevice_dtype
             channels = decoder.channels
+            # Multichannel (Atmos) output only when the device actually
+            # advertises the channels. PortAudio reports the device's
+            # max_output_channels, which is what the OS mixer is
+            # configured for; asking for more raises at open time, so
+            # check first and downmix instead of failing the load. On
+            # Windows shared mode the endpoint's bed is also what
+            # Spatial Sound virtualises, so a 5.1 source is padded up
+            # to a 7.1 endpoint rather than left short.
+            if channels > 2:
+                device_max = self._device_max_output_channels(device)
+                windows = sys.platform.startswith("win")
+                target_channels = _resolve_surround_channels(
+                    decoder.source_channels,
+                    device_max,
+                    windows=windows,
+                    exclusive=self._exclusive_mode,
+                )
+                if (
+                    windows
+                    and not self._exclusive_mode
+                    and target_channels < channels
+                    and device_override is None
+                ):
+                    # A stereo WASAPI mix format does not mean the
+                    # endpoint can't take the bed: Windows' spatial APO
+                    # holds a 5.1/7.1 bed internally while the mix
+                    # format it advertises stays stereo. The legacy
+                    # MME/DirectSound copies of the same device accept
+                    # the layout and hand it to that APO, which is why
+                    # VLC (waveout) gets surround on this endpoint and
+                    # a WASAPI-only player does not. Re-open the same
+                    # logical device through one of those host APIs
+                    # before falling back to a downmix.
+                    alt_device, alt_hostapi = resolve_surround_output_device(
+                        self._selected_device_id,
+                        channels,
+                        sample_rate,
+                        dtype,
+                    )
+                    if alt_device is not None and alt_device != device:
+                        log.info(
+                            "Windows spatial: routing %d-channel bed to "
+                            "device %d (hostapi=%s) instead of downmixing "
+                            "on the %d-channel WASAPI copy",
+                            channels,
+                            alt_device,
+                            alt_hostapi,
+                            device_max,
+                        )
+                        print(
+                            f"[audio] spatial: device {device} "
+                            f"({device_max}ch) cannot carry "
+                            f"{channels}ch; using device {alt_device} "
+                            f"hostapi={alt_hostapi!r}",
+                            flush=True,
+                        )
+                        device = alt_device
+                        device_max = self._device_max_output_channels(device)
+                        target_channels = _resolve_surround_channels(
+                            decoder.source_channels,
+                            device_max,
+                            windows=windows,
+                            exclusive=self._exclusive_mode,
+                        )
+                if target_channels != channels:
+                    if target_channels < channels:
+                        log.info(
+                            "device supports %d output channels; downmixing "
+                            "%d-channel source to %d",
+                            device_max,
+                            channels,
+                            target_channels,
+                        )
+                        if windows and device_max is not None and device_max <= 2:
+                            log.info(
+                                "Windows Spatial Sound is not seeing a "
+                                "multichannel endpoint; enable Spatial sound "
+                                "on this output (or pick the spatial device) "
+                                "and reload to virtualise the surround bed"
+                            )
+                    else:
+                        log.info(
+                            "Windows Spatial Sound: padding %d-channel source "
+                            "to the endpoint's %d-channel bed",
+                            channels,
+                            target_channels,
+                        )
+                    decoder.set_target_channels(target_channels)
+                    channels = decoder.channels
 
         # Exclusive Mode — push PCM straight at the device at its
         # native rate / bit depth. On macOS the CoreAudio flags ask
@@ -2981,38 +6104,60 @@ class PCMPlayer:
             stream_kwargs["extra_settings"] = extra_settings
 
         try:
-            self._stream = sd.OutputStream(**stream_kwargs)
-        except Exception:
-            # Exclusive Mode can fail on devices that refuse the
-            # requested rate / format (e.g. a USB DAC pinned to 48k
-            # when the track is 44.1k). Fall back to shared mode so
-            # playback keeps working. We also need to switch the
-            # decoder to mixer-rate output for the same intersample-
-            # peak reason as above, since the fallback puts us in
-            # shared mode.
-            if extra_settings is not None:
+            self._stream = self._pa_open_stream(stream_kwargs)
+        except Exception as open_exc:
+            opened = False
+            if decoder is not None and stream_kwargs.get("channels", 2) > 2:
+                # The device advertised the channels but still refused the
+                # open (common on Windows hosts whose mixer is configured
+                # for stereo while the jack reports 5.1). Downmix and
+                # retry before touching exclusive mode.
                 log.warning(
-                    "Exclusive-mode stream open failed; falling back to shared"
+                    "multichannel stream open failed (%s); downmixing to stereo",
+                    open_exc,
                 )
-                stream_kwargs.pop("extra_settings", None)
-                if decoder is not None:
-                    fallback_rate = self._query_device_mixer_rate(
-                        device, decoder.sample_rate
+                decoder.set_target_channels(2)
+                stream_kwargs["samplerate"] = decoder.output_sample_rate
+                stream_kwargs["channels"] = decoder.channels
+                stream_kwargs["dtype"] = decoder.sounddevice_dtype
+                try:
+                    self._stream = self._pa_open_stream(stream_kwargs)
+                    opened = True
+                except Exception:
+                    pass
+            if not opened:
+                # Exclusive Mode can fail on devices that refuse the
+                # requested rate / format (e.g. a USB DAC pinned to 48k
+                # when the track is 44.1k). Fall back to shared mode so
+                # playback keeps working. We also need to switch the
+                # decoder to mixer-rate output for the same intersample-
+                # peak reason as above, since the fallback puts us in
+                # shared mode.
+                if extra_settings is not None:
+                    log.warning(
+                        "Exclusive-mode stream open failed; falling back to shared"
                     )
-                    decoder.set_target_rate(
-                        fallback_rate,
-                        float_output=self._float_output_for(False),
-                    )
-                    stream_kwargs["samplerate"] = decoder.output_sample_rate
-                    stream_kwargs["dtype"] = decoder.sounddevice_dtype
-                    sample_rate = decoder.output_sample_rate
-                    channels = decoder.channels
-                    stream_kwargs["blocksize"] = self._callback_block_frames(
-                        sample_rate
-                    )
-                self._stream = sd.OutputStream(**stream_kwargs)
-            else:
-                raise
+                    stream_kwargs.pop("extra_settings", None)
+                    if decoder is not None:
+                        fallback_rate = self._query_device_mixer_rate(
+                            device, decoder.sample_rate
+                        )
+                        decoder.set_target_rate(
+                            fallback_rate,
+                            float_output=self._float_output_for(False),
+                        )
+                        stream_kwargs["samplerate"] = decoder.output_sample_rate
+                        stream_kwargs["dtype"] = decoder.sounddevice_dtype
+                        stream_kwargs["channels"] = decoder.channels
+                        stream_kwargs["blocksize"] = self._callback_block_frames(
+                            decoder.output_sample_rate
+                        )
+                    self._stream = self._pa_open_stream(stream_kwargs)
+                else:
+                    raise
+        sample_rate = stream_kwargs["samplerate"]
+        channels = stream_kwargs["channels"]
+        dtype = stream_kwargs["dtype"]
 
         # Pin the cached stream-state to whatever we actually opened
         # at. set_exclusive_mode and set_output_device read these to
@@ -3038,14 +6183,51 @@ class PCMPlayer:
             ha_name = ha.get("name") if isinstance(ha, dict) else "?"
         except Exception:
             ha_name = "?"
+        source_channels = (
+            decoder.source_channels if decoder is not None else None
+        )
         print(
             f"[audio] stream open: device={device} rate={sample_rate}Hz "
-            f"channels={channels} dtype={dtype!r} hostapi={ha_name!r} "
-            f"exclusive={self._exclusive_mode} "
+            f"channels={channels} source_channels={source_channels} "
+            f"device_max_channels={device_max} dtype={dtype!r} "
+            f"hostapi={ha_name!r} exclusive={self._exclusive_mode} "
             f"block={stream_kwargs['blocksize']}",
             file=sys.stderr,
             flush=True,
         )
+        # Mirror to the persistent audio log too: a Finder-launched
+        # build has no console, and whether a 5.1/7.1 bed actually
+        # reached the endpoint is the first thing to check when
+        # spatial audio "doesn't work".
+        audio_log.info(
+            "stream open: device=%s rate=%sHz channels=%s "
+            "source_channels=%s device_max_channels=%s dtype=%r "
+            "hostapi=%r exclusive=%s",
+            device,
+            sample_rate,
+            channels,
+            source_channels,
+            device_max,
+            dtype,
+            ha_name,
+            self._exclusive_mode,
+        )
+        # Remember what this open actually negotiated. The Signal Path
+        # panel reads the live stream fields; the Atmos tester needs
+        # this after the fact — a native/PCM A-B comparison is only
+        # meaningful with the host API and channel count attached.
+        with self._lock:
+            self._last_open_diag = {
+                "device": device,
+                "device_name": dev_info.get("name"),
+                "hostapi": ha_name,
+                "sample_rate_hz": sample_rate,
+                "channels": channels,
+                "source_channels": source_channels,
+                "device_max_channels": device_max,
+                "dtype": dtype,
+                "exclusive": bool(self._exclusive_mode),
+            }
 
         # Rebuild the EQ against the new sample rate. Preserves
         # whichever mode is active — manual bands or AutoEQ profile.
@@ -3091,6 +6273,21 @@ class PCMPlayer:
             except Exception:
                 log.exception("crossfeed coefficient build failed")
                 self._crossfeed.clear()
+
+    @staticmethod
+    def _device_max_output_channels(device: Optional[int]) -> Optional[int]:
+        """How many output channels the device's current mixer config
+        exposes, or None when PortAudio can't tell us."""
+        try:
+            info = sd.query_devices(device, kind="output")
+        except Exception:
+            return None
+        value = info.get("max_output_channels") if isinstance(info, dict) else None
+        try:
+            channels = int(value)
+        except (TypeError, ValueError):
+            return None
+        return channels if channels > 0 else None
 
     @staticmethod
     def _query_device_mixer_rate(device: Optional[int], fallback: int) -> int:
@@ -3182,6 +6379,157 @@ class PCMPlayer:
         except (TypeError, ValueError):
             high_f = 0.0
         return max(PCMPlayer._OUTPUT_LATENCY_FLOOR_S, high_f)
+
+    def _ensure_stream_started(self) -> None:
+        """Start the open output stream, reopening it if the first
+        attempt fails.
+
+        PortAudio's Windows backend raises `Unanticipated host error
+        [PaErrorCode -9999]` from IAudioClient::Start when the driver
+        hasn't finished releasing the endpoint after close() — the
+        gapless swap in load() exists to avoid exactly this race, but
+        a full teardown + fresh open (format change, device change,
+        stop) still has to close and reopen. When that race is lost,
+        every following play fails the same way until the endpoint
+        settles, so reopening after a short delay instead of parking
+        the player in `error` is what keeps the queue moving.
+
+        A Windows Spatial Sound change ("Dolby Atmos for Headphones"
+        is the common one) is the harder case: the endpoint is torn
+        down and rebuilt, and the cached WASAPI copy can then refuse
+        to start for as long as PortAudio keeps its stale enumeration
+        — observed as a minute of failures while a fresh process
+        opened the same device fine. So the retries widen each round:
+        reopen, re-enumerate PortAudio, route to another host-API copy
+        of the same speakers (MME/DirectSound are untouched by the
+        spatial APO), then the system default. The last attempt's
+        exception is re-raised so a genuinely dead device still
+        surfaces in the UI.
+        """
+        stream = self._stream
+        if stream is None or stream.active:
+            return
+        # WASAPI needs COM on the thread that starts the stream, and
+        # this runs on HTTP workers / recovery threads (win_com.py).
+        try:
+            self._start_stream(stream)
+            return
+        except Exception as exc:
+            log.warning("stream.start failed (%s); reopening", exc)
+            audio_log.warning("stream.start failed (%s); reopening", exc)
+
+        last_exc: Optional[BaseException] = None
+        # Muzzle the finished_callback the aborted stream fires below:
+        # with the device-loss heuristic a stop from a stream we are
+        # replacing must not spawn a second recovery on top of this one.
+        with self._lock:
+            self._replacing_stream = True
+        try:
+            for delay, tier in (
+                (0.3, "reopen"),
+                (0.7, "reenumerate"),
+                (1.5, "alternate-hostapi"),
+                (2.0, "system-default"),
+            ):
+                time.sleep(delay)
+                self._close_failed_stream()
+                if tier == "reenumerate":
+                    self._reinit_portaudio()
+                try:
+                    self._open_stream_tier(tier)
+                    audio_log.info(
+                        "stream.start recovered after reopen (%s)", tier
+                    )
+                    print(
+                        f"[audio] stream.start recovered after reopen "
+                        f"({tier})",
+                        flush=True,
+                    )
+                    return
+                except Exception as exc:
+                    last_exc = exc
+                    audio_log.warning(
+                        "stream.start reopen failed (%s): %s", tier, exc
+                    )
+            # Every tier failed: drop the corpse so the next load takes
+            # the full-reopen path instead of rebinding a new track to
+            # a stream that never started. That reuse is what turned
+            # one bad endpoint into a queue-wide track-advance loop.
+            self._close_failed_stream()
+        finally:
+            with self._lock:
+                self._replacing_stream = False
+        if last_exc is not None:
+            raise last_exc
+
+    def _close_failed_stream(self) -> None:
+        old = self._stream
+        self._stream = None
+        self._callback_carry = None
+        _close_pa_stream(old)
+
+    @staticmethod
+    def _reinit_portaudio() -> None:
+        """Force PortAudio to re-enumerate the endpoints.
+
+        The device list — and with it each WASAPI endpoint's state — is
+        cached at init time. A spatial-audio change invalidates the
+        cached endpoint in place, so a reopen without this keeps
+        hitting the same dead client until the process restarts.
+
+        pa_guard refuses while any stream in the process is still open
+        (ours, or the Atmos tester's own player): terminating PortAudio
+        under a live handle crashes the next call on it. The caller
+        then walks on to the next recovery tier, which works without a
+        fresh enumeration.
+        """
+        pa_guard.reinit_portaudio()
+
+    def _open_stream_tier(self, tier: str) -> None:
+        """One recovery attempt of `_ensure_stream_started`. Raises on
+        failure so the caller can walk to the next tier."""
+        sample_rate = self._stream_sample_rate or 48000
+        channels = self._stream_channels or 2
+        sd_dtype = self._stream_sd_dtype or "float32"
+        if tier == "alternate-hostapi":
+            current, _ = resolve_output_device(self._selected_device_id)
+            alt, alt_hostapi = resolve_fallback_output_device(
+                self._selected_device_id,
+                channels,
+                sample_rate,
+                sd_dtype,
+                exclude=current,
+            )
+            if alt is None:
+                raise RuntimeError(
+                    "no other host-API copy of the device can open"
+                )
+            log.info(
+                "stream recovery: routing to device %d (hostapi=%s)",
+                alt,
+                alt_hostapi,
+            )
+            print(
+                f"[audio] stream recovery: routing to device {alt} "
+                f"hostapi={alt_hostapi!r}",
+                flush=True,
+            )
+            self._open_output_stream(
+                sample_rate, channels, sd_dtype, device_override=alt
+            )
+        elif tier == "system-default":
+            saved = self._selected_device_id
+            self._selected_device_id = ""
+            try:
+                self._open_output_stream(sample_rate, channels, sd_dtype)
+            finally:
+                self._selected_device_id = saved
+        else:
+            self._open_output_stream(sample_rate, channels, sd_dtype)
+        fresh = self._stream
+        if fresh is None:
+            raise RuntimeError("output stream open produced no stream")
+        fresh.start()
 
     def _start_decoder_thread(self) -> None:
         # Bind the decoder / queue / flags to the thread's locals at
@@ -3412,6 +6760,10 @@ class PCMPlayer:
                 if not active:
                     self._stall_dumped = False
                     continue
+                stream = self._stream
+                if self._watchdog_recover_dead_stream(stream):
+                    self._stall_dumped = False
+                    continue
                 silent_for = time.monotonic() - last
                 if silent_for < STALL_S:
                     self._stall_dumped = False
@@ -3444,6 +6796,40 @@ class PCMPlayer:
             except Exception:
                 # The watchdog must never take the process down.
                 pass
+
+    def _watchdog_recover_dead_stream(self, stream) -> bool:
+        """Kick device-loss recovery when the output stream is gone
+        while the player reports "playing".
+
+        A Windows Spatial Sound change reconfigures the endpoint in
+        place, and the old client just disappears; PortAudio does not
+        reliably call finished_callback for that, so without this the
+        player would sit in "playing" over silence until the user
+        noticed. Recovery reopens at the same position — the decoder
+        queue is untouched. Rate limited because the watchdog ticks
+        every 5s and a reopen takes a moment.
+
+        Lock-free, like its caller: plain attribute reads only.
+        """
+        if stream is None or stream.active or self._replacing_stream:
+            return False
+        now = time.monotonic()
+        if now - self._last_watchdog_recover_t < 10.0:
+            return False
+        self._last_watchdog_recover_t = now
+        try:
+            audio_log.warning(
+                "watchdog: output stream inactive while playing "
+                "(device reconfigured?); recovering"
+            )
+        except Exception:
+            pass
+        threading.Thread(
+            target=self._recover_from_device_loss,
+            name="pcm-watchdog-recovery",
+            daemon=True,
+        ).start()
+        return True
 
     def _tick_load_stall(self) -> None:
         """One stuck-loading recovery tick.
@@ -3939,10 +7325,7 @@ class PCMPlayer:
                 old_stream.abort()
             except Exception:
                 pass
-            try:
-                old_stream.close()
-            except Exception:
-                pass
+            _close_pa_stream(old_stream)
             # Re-open at the new rate.
             self._open_output_stream(
                 pre.sample_rate, pre.channels, pre.sd_dtype
@@ -4406,15 +7789,25 @@ class PCMPlayer:
             # Natural EOF, by contrast, has both the decoder done AND
             # the queue drained — the callback got everything out
             # before raising CallbackStop.
+            #
+            # `paused` counts as active here: the callback never drains
+            # while paused, so a friendly end is impossible, and
+            # Windows reports a Spatial Sound change (enable "Dolby
+            # Atmos for Headphones") by killing the stream exactly this
+            # way. A preload no longer exempts the stream either —
+            # bridging to the next track on a dead endpoint just moved
+            # the failure one track later. Never emit `ended` for this:
+            # the frontend treats `ended` as "advance" and the whole
+            # queue skips itself.
             decoder_done = self._decoder_done.is_set()
             queue_pending = (
                 self._pcm_queue.qsize() > 0
                 if self._pcm_queue is not None
                 else False
             )
-            was_playing = self._state == "playing"
+            was_active = self._state in ("playing", "paused")
             pre = self._preload
-            should_recover = was_playing and pre is None and (
+            should_recover = was_active and (
                 not decoder_done or queue_pending
             )
             if should_recover:
@@ -4462,11 +7855,7 @@ class PCMPlayer:
                 self._preload = None
 
         if renderer_clock:
-            if bound_stream is not None:
-                try:
-                    bound_stream.close()
-                except Exception:
-                    pass
+            _close_pa_stream(bound_stream)
             return
 
         # Cross-rate bridge: preload exists but has a different
@@ -4501,11 +7890,7 @@ class PCMPlayer:
         with self._lock:
             self._stream = None
             self._transition("ended")
-        if old_stream is not None:
-            try:
-                old_stream.close()
-            except Exception:
-                pass
+        _close_pa_stream(old_stream)
         # Signal source_done to the DLNA passthrough encoder so the
         # renderer sees a clean end-of-stream instead of hanging on
         # the HTTP connection until the 30s write timeout kicks in.
@@ -4578,23 +7963,12 @@ class PCMPlayer:
                     self._replacing_stream = False
                 return
 
-            try:
-                old_stream.close()
-            except Exception:
-                pass
+            _close_pa_stream(old_stream)
 
-            # Force PortAudio to re-enumerate CoreAudio. Without
-            # this, devices that plugged in since the last init
-            # are invisible to PortAudio even though CoreAudio
-            # sees them.
-            try:
-                sd._terminate()
-            except Exception:
-                pass
-            try:
-                sd._initialize()
-            except Exception:
-                log.exception("device-recovery: PortAudio reinit failed")
+            # Force PortAudio to re-enumerate so devices that
+            # disappeared/plugged in since the last init are seen.
+            # pa_guard no-ops if another stream is still open.
+            self._reinit_portaudio()
 
             # _open_output_stream now falls back to the system default
             # on its own when the saved device is gone (it no longer
@@ -4637,10 +8011,32 @@ class PCMPlayer:
             except Exception as exc:
                 log.info(
                     "device-recovery: original device id=%r "
-                    "unavailable (%r); falling back to system default",
+                    "unavailable (%r); trying another host-API copy",
                     original_device_id, exc,
                 )
-                # Reset state for the second attempt.
+                # The name still resolved, so the endpoint exists and
+                # only this host API's client is unusable — the state a
+                # Windows Spatial Sound change leaves the WASAPI copy
+                # in. MME/DirectSound are separate clients on the same
+                # speakers and keep working.
+                try:
+                    with self._lock:
+                        self._open_stream_tier("alternate-hostapi")
+                    log.info(
+                        "device-recovery: reopened on another host-API "
+                        "copy of device id=%r",
+                        original_device_id,
+                    )
+                    with self._lock:
+                        self._replacing_stream = False
+                    return
+                except Exception as alt_exc:
+                    log.info(
+                        "device-recovery: alternate host-API copy of "
+                        "id=%r also failed (%r)",
+                        original_device_id, alt_exc,
+                    )
+                # Reset state for the default-device attempt.
                 with self._lock:
                     self._selected_device_id = ""
                     self._stream = None
@@ -4726,11 +8122,7 @@ class PCMPlayer:
             # resources.
             old_stream = self._stream
             self._stream = None
-            if old_stream is not None:
-                try:
-                    old_stream.close()
-                except Exception:
-                    pass
+            _close_pa_stream(old_stream)
             # Close the old decoder (thread has already exited since
             # decoder_done fired).
             old_decoder = self._decoder
@@ -4803,6 +8195,23 @@ class PCMPlayer:
                 listener(snap)
             except Exception:
                 log.exception("listener raised")
+
+    def _discard_pipeline(self, pre: "_Preload") -> None:
+        """Stop a decoder thread whose track will never be adopted."""
+        pre.stop_flag.set()
+        decoder = pre.decoder
+        if decoder is None:
+            return
+        try:
+            decoder.cancel_source()
+        except Exception:
+            pass
+        if pre.thread is not None and pre.thread.is_alive():
+            pre.thread.join(timeout=0.5)
+        try:
+            decoder.close()
+        except Exception:
+            pass
 
     def _swap_pipeline_to(self, pre: "_Preload") -> None:
         """Replace the active pipeline refs with those from `pre`.
@@ -4917,6 +8326,20 @@ def _replaygain_tags_from(info: Optional[StreamInfo]) -> ReplayGainTags:
     )
 
 
+def _tag_reference_shift_db(info: Optional[StreamInfo]) -> float:
+    """Offset that moves tag-driven gain onto our -16 LUFS reference.
+
+    TIDAL's own ReplayGain tags are normalized to about -14 LUFS, so
+    they attenuate ~2 dB less than the same track does when we measure
+    it locally (or than Apple's Sound Check does). Only stream tags
+    need the shift: a local file's tags come from the user's tagger,
+    which follows the ReplayGain spec instead.
+    """
+    if info is None or info.source == "local":
+        return 0.0
+    return loudness.TARGET_LUFS - TIDAL_TAG_REFERENCE_LUFS
+
+
 def _safe_float(v: object) -> Optional[float]:
     if v is None:
         return None
@@ -4945,6 +8368,8 @@ def _normalize_codec(raw: object) -> Optional[str]:
         return "alac"
     if "mp4a" in s or "aac" in s:
         return "aac"
+    if "ec-3" in s or "eac3" in s:
+        return "eac3"
     if "mp3" in s:
         return "mp3"
     if "opus" in s:
@@ -4954,17 +8379,320 @@ def _normalize_codec(raw: object) -> Optional[str]:
     return s
 
 
+def _is_atmos_stream_info(info: Optional[StreamInfo]) -> bool:
+    if info is None:
+        return False
+    return str(getattr(info, "audio_mode", "") or "").upper() == "DOLBY_ATMOS"
+
+
+# Spatial formats that place Dolby Atmos objects. Any other active
+# spatialiser (Windows Sonic, DTS, or none) virtualises the 7.1 bed the
+# native pipeline hands it instead — the JOC objects are decoded but
+# nothing puts them anywhere. Names match winrt_player.ps1's slugs.
+_ATMOS_SPATIAL_FORMATS = frozenset(
+    {"atmos-headphones", "atmos-home-theater", "atmos-speakers"}
+)
+
+# Codecs whose content is Dolby. Classification reads the codec rather
+# than audio_mode: the local probe marks every >2-channel file as
+# DOLBY_ATMOS (a 5.1 FLAC included), which would badge plain surround
+# as Dolby.
+_DOLBY_CODECS = frozenset({"eac3", "ac3", "ac4", "truehd"})
+
+
+def _dolby_playback_kind(
+    info: Optional[StreamInfo],
+    *,
+    native: bool,
+    spatial_format: str,
+    decoders: tuple[str, ...] | list[str] = (),
+) -> Optional[str]:
+    """How Dolby content is actually reaching the listener.
+
+    "atmos"       the native pipeline decoded the JOC objects and a
+                  Dolby Atmos spatial format on the endpoint placed them.
+    "dolby_audio" the same mix is audible only as its 5.1/7.1 bed: the
+                  native pipeline with a non-Atmos (or no) spatial
+                  format, or any Dolby asset on the PCM path, where PyAV
+                  drops the object metadata before Windows sees it.
+    None          not Dolby content.
+
+    `decoders` is the helper's loaded-module list. It is empty until
+    MediaPlayer starts decoding, so an empty list means "not known
+    yet", not "no Dolby decoder" — only a populated list without a
+    Dolby module proves Windows fell back to a downmix.
+    """
+    if info is None:
+        return None
+    if str(info.codec or "").lower() not in _DOLBY_CODECS:
+        return None
+    if not native:
+        return "dolby_audio"
+    if str(spatial_format or "").lower() not in _ATMOS_SPATIAL_FORMATS:
+        return "dolby_audio"
+    if decoders and not any("dolby" in str(d).lower() for d in decoders):
+        return "dolby_audio"
+    return "atmos"
+
+
+# Containers that can carry E-AC-3 JOC / AC-4. Checked before the
+# libav probe so ordinary FLAC/MP3 local loads never pay for the
+# extra container open the native-atmos decision needs.
+_NATIVE_ATMOS_EXTS = frozenset({".m4a", ".mp4", ".mov", ".ac4"})
+
+# A streamed Atmos track exists only as a DASH segment list, and the
+# native pipeline opens one file. Segments are therefore concatenated
+# into one file before playback. This bounds how long a load waits
+# for that: past it the click answers with the PCM engine (the 5.1/7.1
+# bed) rather than leaving the user in silence.
+_NATIVE_STREAM_BUFFER_DEADLINE_S = 20.0
+# How long a buffered track's in-memory record is reused without a
+# re-read of its sidecar. The file itself is not bound by this — see
+# the disk budget below.
+_NATIVE_STREAM_TTL_S = 600.0
+# A failed buffer retries sooner than a good one expires — a dropped
+# connection is usually transient — but not on every click.
+_NATIVE_STREAM_FAILURE_TTL_S = 60.0
+# Where buffered tracks live. These were %TEMP%/tideway-atmos-* scratch
+# dirs, which cost 20-30 MB per track, died with the process, and — the
+# sweep nobody owned — were never deleted even then. Under the data dir
+# a replay of the same Atmos track, including one after an app restart,
+# opens the file instead of downloading it again.
+_NATIVE_STREAM_CACHE_DIR = "atmos_cache"
+# Each file is 20-30 MB, so this holds roughly an album and a half of
+# Atmos material; past it the least recently downloaded files go first.
+_NATIVE_STREAM_DISK_MAX_BYTES = 512 * 1024 * 1024
+# Files nobody has touched in a month are not a replay worth keeping.
+_NATIVE_STREAM_DISK_MAX_AGE_S = 30 * 24 * 3600
+# DASH playback: how long the click waits for the init segment and the
+# first media fragment. Measured at ~0.5 s on a cold track and near
+# zero when the hover/album prefetch already seeded them; the bound only
+# decides how quickly a stalled download hands the track to the PCM bed.
+_DASH_PRIME_DEADLINE_S = 8.0
+# A DASH write keeps going long after playback starts; this is its own
+# bound, mirroring the preload's.
+_DASH_DEADLINE_S = 180.0
+# If the helper rejects the adaptive source, the download is still
+# running: how long the fallback waits for the joined file.
+_DASH_FALLBACK_WAIT_S = 60.0
+# How often the click re-checks the writer while waiting to prime.
+_DASH_POLL_S = 0.02
+# After a give-up, how long to wait for the cancelled writer to close
+# its handle before the whole-file fallback rewrites the same path.
+_DASH_CANCEL_WAIT_S = 2.0
+# How long a helper opened by the look-ahead stays worth adopting. Its
+# session is closed when the queue moves on, so this only retires one
+# nobody ever clicked.
+_WARM_HELPER_TTL_S = 300.0
+# Advisory bitrate in the manifest. One representation, so nothing
+# selects on it; Media Foundation only wants a plausible number.
+_DASH_BANDWIDTH_BPS = 800000
+# Attempts to delete a retired segment directory. MediaPlayer releases
+# the files a moment after `Source` is replaced, so the first tries can
+# lose a sharing race; the startup sweep takes whatever is left.
+_DASH_DIR_DELETE_TRIES = 5
+_DASH_DIR_DELETE_DELAY_S = 0.4
+
+
+@dataclass(eq=False)
+class _ResolveTicket:
+    """One in-flight manifest resolve, shared by every caller that
+    wants the same (track, quality).
+
+    `event` fires when the leader is done; `result` / `error` carry
+    what it found. A waiter that wakes to neither (its entry was
+    evicted from the cache) resolves on its own.
+    """
+
+    event: threading.Event = field(default_factory=threading.Event)
+    result: Optional[tuple] = None
+    error: Optional[BaseException] = None
+
+
+@dataclass
+class _BufferedAtmos:
+    """One streamed Atmos track materialized as a local file."""
+
+    path: str
+    duration_s: Optional[float]
+    info: StreamInfo
+    expires_at: float
+
+
+@dataclass(eq=False)
+class _DashAtmos:
+    """A streamed Atmos track served to MediaPlayer as DASH.
+
+    `primed` fires once the init segment and the first media segment
+    exist, `done` when the download finished (or failed), and `cancel`
+    is how a new load or a stop stops the download. `done_failed` is
+    written before `done` so a waiter can tell a finish from a give-up.
+    `cache_path` is the joined file, which only exists after `done`.
+
+    One session serves a track whether a click started it or a
+    look-ahead preload did; identity, not value, decides whether a
+    session is the current one — two loads of the same track produce
+    identical field values.
+    """
+
+    track_id: str
+    cache_path: str
+    directory: str
+    url: str
+    publication: DashPublication
+    duration_s: Optional[float]
+    info: StreamInfo
+    primed: threading.Event
+    done: threading.Event
+    cancel: threading.Event
+    done_failed: bool = False
+
+
+def _remove_dash_dir(directory: str) -> None:
+    """Delete a retired segment directory, retrying past the point
+    where MediaPlayer still holds the files open."""
+    for attempt in range(_DASH_DIR_DELETE_TRIES):
+        if attempt:
+            time.sleep(_DASH_DIR_DELETE_DELAY_S)
+        try:
+            shutil.rmtree(directory)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            continue
+    log.debug("atmos dash: leaving %s for the startup sweep", directory)
+
+
+def _atmos_sidecar_path(path: str) -> str:
+    return path + ".json"
+
+
+def _write_atmos_sidecar(
+    path: str, duration_s: Optional[float], info: StreamInfo
+) -> None:
+    """Persist what the buffered file is, next to the file itself.
+
+    The player needs more than the container says: `source` and
+    `audio_quality` select the now-playing badge, and the ReplayGain
+    tags are TIDAL's own normalization data, which no probe can
+    recover from the bytes. Without this sidecar a re-adopted file fell
+    back to an R128 scan of every Atmos track after each restart.
+
+    The size is recorded so a later read can tell a finished file from
+    one truncated by a crash — `os.replace` publishes the audio and the
+    sidecar separately, so both need a way to agree they belong
+    together.
+    """
+    sidecar = _atmos_sidecar_path(path)
+    partial = sidecar + ".part"
+    try:
+        payload = {
+            "version": 1,
+            "size": os.path.getsize(path),
+            "duration_s": duration_s,
+            "info": asdict(info),
+        }
+        with open(partial, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        os.replace(partial, sidecar)
+    except OSError as exc:
+        log.debug("atmos cache sidecar write failed for %s: %s", path, exc)
+        try:
+            os.remove(partial)
+        except OSError:
+            pass
+
+
+def _read_atmos_sidecar(path: str) -> Optional[dict]:
+    """The sidecar's payload, or None when it is missing/unreadable or
+    describes a different file than the one on disk."""
+    try:
+        with open(_atmos_sidecar_path(path), encoding="utf-8") as fh:
+            payload = json.load(fh)
+        if not isinstance(payload, dict) or payload.get("version") != 1:
+            return None
+        if payload.get("size") != os.path.getsize(path):
+            return None
+        if not isinstance(payload.get("info"), dict):
+            return None
+    except (OSError, ValueError):
+        return None
+    return payload
+
+
+def _remove_atmos_cache_file(path: str) -> None:
+    """Drop a buffered file and its sidecar, best effort."""
+    for target in (path, _atmos_sidecar_path(path)):
+        try:
+            os.remove(target)
+        except OSError:
+            pass
+
+
+def _sweep_legacy_atmos_dirs() -> None:
+    """Delete `tideway-atmos-*` scratch dirs in the temp folder.
+
+    Builds before the persistent cache buffered each track into its own
+    mkdtemp() directory and never removed it: 20-30 MB per track, and
+    hundreds of MB had accumulated. The prefix is specific enough to
+    own every match. Failures (a dir still in use) are ignored.
+    """
+    root = tempfile.gettempdir()
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return
+    removed = 0
+    for name in names:
+        if not name.startswith("tideway-atmos-"):
+            continue
+        path = os.path.join(root, name)
+        if not os.path.isdir(path):
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        removed += 1
+    if removed:
+        log.info("atmos cache: removed %d legacy temp dirs", removed)
+
+
+
+def _local_file_is_atmos(path: str) -> bool:
+    """True when libav's codec profile for `path` names Dolby Atmos.
+
+    libav reports the JOC object layer as the profile string ("Dolby
+    Digital Plus + Dolby Atmos"), which is far more reliable than
+    scanning the bitstream — a 'joc' byte scan matched media payload
+    bytes in testing. A file whose container doesn't decorate the
+    profile stays on the PCM engine: there is no evidence the native
+    pipeline would add anything.
+    """
+    try:
+        import av
+
+        with av.open(path) as container:
+            for stream in container.streams.audio:
+                profile = str(stream.codec_context.profile or "").lower()
+                if "atmos" in profile:
+                    return True
+    except Exception:
+        return False
+    return False
+
+
 def _build_source(
     spec: Union[str, list[str]],
     prefetched: Optional[dict[int, bytes]] = None,
+    sink: Optional[object] = None,
 ) -> Union[str, SegmentReader]:
     """Materialize a source spec into something Decoder can open.
     If the caller already fetched the first few segments via the
     byte-level prefetch path, hand them to SegmentReader so it
-    skips the corresponding network fetches."""
+    skips the corresponding network fetches. `sink`, when given,
+    receives every segment byte in order (disk cache tee)."""
     if isinstance(spec, str):
         return spec
-    return SegmentReader(spec, prefetched=prefetched)
+    return SegmentReader(spec, prefetched=prefetched, sink=sink)
 
 
 def _probe_local_stream_info(
@@ -4992,12 +8720,17 @@ def _probe_local_stream_info(
         return None, None
     info = m.info
     codec: Optional[str] = None
-    mime_list = getattr(info, "mime", None) or []
-    if mime_list:
-        codec = _normalize_codec(mime_list[0])
+    raw_codec_attr = getattr(info, "codec", None)
+    if raw_codec_attr:
+        codec = _normalize_codec(raw_codec_attr)
+    if codec is None:
+        mime_list = getattr(info, "mime", None) or []
+        if mime_list:
+            codec = _normalize_codec(mime_list[0])
     if codec is None:
         ext = os.path.splitext(path)[1].lstrip(".").lower()
         codec = _normalize_codec(ext)
+    is_atmos_local = codec in ("eac3", "ac4") or getattr(info, "channels", 2) > 2
     rg = _read_local_replaygain(m)
     raw_length = getattr(info, "length", None)
     try:
@@ -5009,6 +8742,12 @@ def _probe_local_stream_info(
         codec=codec,
         bit_depth=_safe_int(getattr(info, "bits_per_sample", None)),
         sample_rate_hz=_safe_int(getattr(info, "sample_rate", None)),
+        audio_quality=(
+            getattr(info, "audio_quality", None)
+            if hasattr(info, "audio_quality")
+            else None
+        ),
+        audio_mode="DOLBY_ATMOS" if is_atmos_local else "STEREO",
         track_replay_gain_db=rg.track_gain_db,
         track_peak=rg.track_peak,
         album_replay_gain_db=rg.album_gain_db,

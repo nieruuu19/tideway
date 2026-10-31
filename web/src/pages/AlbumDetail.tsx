@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
-import { useParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
+import { Music } from "lucide-react";
 import { api } from "@/api/client";
 import type { Album, Artist } from "@/api/types";
 import type { OnDownload } from "@/api/download";
 import { useApi } from "@/hooks/useApi";
-import { queryKeys } from "@/api/queryKeys";
+import { prefetch, queryKeys } from "@/api/queryKeys";
+import { QUALITY_TONE } from "@/lib/qualityTiers";
 import { useTrackPrefetch } from "@/hooks/useTrackPrefetch";
 import { AddToLibraryButton } from "@/components/AddToLibraryButton";
 import { AddToCollectionButton } from "@/components/AddToCollectionButton";
@@ -196,6 +198,10 @@ export function AlbumDetail({ onDownload }: { onDownload: OnDownload }) {
         />
       )}
 
+      {album.other_versions.length > 0 && (
+        <OtherVersions versions={album.other_versions} />
+      )}
+
       {album.review && (
         <>
           <SectionHeader title="About this album" />
@@ -331,6 +337,87 @@ const ROW_ITEM_VISIBILITY = [
 ];
 
 /**
+ * Other editions of the record you're looking at — Tidal's own clients
+ * put this right under the tracklist, and it's the only place the
+ * catalog exposes e.g. an Atmos master or the deluxe reissue as a
+ * separate release. The backend groups the artist's discography by
+ * normalised title, so everything here is the same album under a
+ * different edition; the format badge on each card is what tells you
+ * whether that edition is the Atmos / hi-res one.
+ */
+function OtherVersions({ versions }: { versions: Album[] }) {
+  return (
+    <div className="mb-10">
+      <div className="mb-4 flex items-baseline justify-between gap-4">
+        <h2 className="text-xl font-bold tracking-tight">Other versions</h2>
+        <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+          {versions.length} {versions.length === 1 ? "version" : "versions"}
+        </span>
+      </div>
+      <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 2xl:grid-cols-6">
+        {versions.map((v) => (
+          <VersionCard key={v.id} album={v} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function VersionCard({ album }: { album: Album }) {
+  const cover = imageUrl(album.cover);
+  // Tidal sometimes leaves the edition tag out of the title and only
+  // sets `version` — surface it, but don't repeat it when the title
+  // already carries it ("Abbey Road (Super Deluxe Edition)").
+  const version =
+    album.version &&
+    !album.name.toLowerCase().includes(album.version.toLowerCase())
+      ? album.version
+      : null;
+  return (
+    <Link
+      to={`/album/${album.id}`}
+      onMouseEnter={() => prefetch.album(album.id)}
+      className="group flex min-w-0 flex-col gap-3 rounded-lg bg-card p-4 transition-colors duration-200 ease-out hover:bg-accent"
+    >
+      <div className="relative aspect-square w-full overflow-hidden rounded-md bg-secondary">
+        {cover ? (
+          <img
+            src={cover}
+            alt={album.name}
+            loading="lazy"
+            className="h-full w-full object-cover transition-transform duration-300 ease-out group-hover:scale-105"
+          />
+        ) : (
+          <div className="flex h-full w-full items-center justify-center text-muted-foreground">
+            <Music className="h-10 w-10" />
+          </div>
+        )}
+      </div>
+      <div className="min-w-0">
+        {/* The edition tag is the thing that distinguishes these cards,
+            so the title gets two lines instead of truncating it away. */}
+        <div className="line-clamp-2 text-sm font-semibold leading-snug">
+          {album.name}
+          {version && (
+            <span className="font-normal text-muted-foreground">
+              {" "}
+              ({version})
+            </span>
+          )}
+        </div>
+        <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+          {album.year && <span>{album.year}</span>}
+          <span>
+            {album.num_tracks} {album.num_tracks === 1 ? "track" : "tracks"}
+          </span>
+          <AlbumQualityBadge tags={album.media_tags ?? []} short />
+        </div>
+      </div>
+    </Link>
+  );
+}
+
+/**
  * Footer under the tracklist — release date, track count, runtime,
  * and the copyright line (which on most Tidal albums contains the
  * record label). Any individual field that's missing gets dropped
@@ -457,15 +544,28 @@ function formatCompact(n: number): string {
  * Quality-tier pill next to the track-count line, matching Tidal's
  * own album-info badge. Shows the highest tier Tidal advertises for
  * the album:
- *   HI_RES_LOSSLESS        → "Max"      (primary color — FLAC 24/96+)
- *   LOSSLESS / HIRES       → "Lossless" (neutral — FLAC 16/44.1)
- *   DOLBY_ATMOS            → "Dolby Atmos"
- *   SONY_360RA             → "360 Reality Audio"
+ *   HI_RES_LOSSLESS        → "Max"        (gold — FLAC 24/96+)
+ *   LOSSLESS / HIRES       → "Lossless" / "High" (sky — FLAC 16/44.1)
+ *   DOLBY_ATMOS            → "Dolby Atmos" / "Atmos" (violet)
+ *   SONY_360RA             → "360 Reality Audio" (violet)
  *
+ * `short` is for the compact Other versions cards, where the badge
+ * sits on one dense line with the year and track count: it borrows
+ * the picker's own tier names ("High", "Atmos") instead of the
+ * marketing ones. The album header keeps the full names.
+ *
+ * Tones come from the shared tier palette (`lib/qualityTiers`) so the
+ * album page, the quality picker and the mini-player pill agree.
  * Anything else (or an empty tags list) suppresses the badge — no
  * point announcing that a lossy album is lossy.
  */
-function AlbumQualityBadge({ tags }: { tags: string[] }) {
+function AlbumQualityBadge({
+  tags,
+  short = false,
+}: {
+  tags: string[];
+  short?: boolean;
+}) {
   if (!tags || tags.length === 0) return null;
   const set = new Set(tags.map((t) => t.toUpperCase()));
   let label: string;
@@ -473,19 +573,19 @@ function AlbumQualityBadge({ tags }: { tags: string[] }) {
   let title: string;
   if (set.has("HIRES_LOSSLESS") || set.has("HI_RES_LOSSLESS")) {
     label = "Max";
-    tone = "bg-primary/15 text-primary";
+    tone = QUALITY_TONE.max.badge;
     title = "Hi-Res Lossless (FLAC, 24-bit / up to 192 kHz)";
   } else if (set.has("LOSSLESS") || set.has("HIRES")) {
-    label = "Lossless";
-    tone = "bg-foreground/10 text-foreground";
+    label = short ? "High" : "Lossless";
+    tone = QUALITY_TONE.high.badge;
     title = "Lossless (FLAC 16-bit / 44.1 kHz)";
   } else if (set.has("DOLBY_ATMOS")) {
-    label = "Dolby Atmos";
-    tone = "bg-primary/15 text-primary";
+    label = short ? "Atmos" : "Dolby Atmos";
+    tone = QUALITY_TONE.atmos.badge;
     title = "Dolby Atmos immersive audio";
   } else if (set.has("SONY_360RA")) {
     label = "360 RA";
-    tone = "bg-primary/15 text-primary";
+    tone = QUALITY_TONE.atmos.badge;
     title = "Sony 360 Reality Audio";
   } else {
     return null;

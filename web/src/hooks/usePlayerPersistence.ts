@@ -4,7 +4,7 @@ import type { Track } from "@/api/types";
 import type { StreamingQuality } from "@/hooks/useUiPreferences";
 import type { PlayerState, RepeatMode } from "./usePlayer";
 
-const PERSIST_KEY = "tideway:player";
+export const PERSIST_KEY = "tideway:player";
 // Tightened from 5 s to 2 s so the worst-case "you quit between
 // two ticks" loss window is smaller. Persist work is a single
 // JSON.stringify + setItem on a state we already have in memory;
@@ -136,9 +136,14 @@ export function pickRestoreFromPersisted(
 export function usePlayerPersistence(
   stateRef: MutableRefObject<PlayerState>,
   qualityRef: MutableRefObject<StreamingQuality>,
+  /** When supplied, only a page holding the playback lease writes.
+   *  A second Tideway page would otherwise overwrite the backstop (and
+   *  localStorage) with its own queue every couple of seconds. */
+  isOwnerRef?: MutableRefObject<boolean>,
 ): void {
   useEffect(() => {
     const flush = () => {
+      if (isOwnerRef && !isOwnerRef.current) return;
       const s = stateRef.current;
       // Skip writes when nothing's loaded — don't clobber a real
       // prior session. Allow currentTime === 0 because a paused-
@@ -181,5 +186,5 @@ export function usePlayerPersistence(
       window.removeEventListener("pagehide", flush);
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, [stateRef, qualityRef]);
+  }, [stateRef, qualityRef, isOwnerRef]);
 }

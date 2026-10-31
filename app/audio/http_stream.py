@@ -507,6 +507,27 @@ class RingBuffer:
         return self._source_done
 
 
+_FLAC_LAYOUTS = {
+    1: "mono",
+    2: "stereo",
+    3: "2.1",
+    4: "quad",
+    5: "5.0",
+    6: "5.1",
+    7: "6.1",
+    8: "7.1",
+}
+
+
+def _flac_layout(channels: int) -> str:
+    """FFmpeg layout name for a channel count. FLAC allows 1-8
+    channels; anything outside that range falls back to the legacy
+    stereo/mono split so the encoder never receives a bogus layout
+    (a 6-channel frame labelled "mono" makes the muxer write a corrupt
+    stream instead of raising)."""
+    return _FLAC_LAYOUTS.get(int(channels), "stereo" if channels == 2 else "mono")
+
+
 class FlacStreamEncoder:
     """PCM chunks in, FLAC bytes out.
 
@@ -600,7 +621,7 @@ class FlacStreamEncoder:
         # accepts integer sample formats (s16 / s32 / s32p); we
         # never send "flt" to a FLAC stream.
         codec_ctx = self._stream.codec_context  # type: ignore
-        codec_ctx.layout = "stereo" if self.channels == 2 else "mono"
+        codec_ctx.layout = _flac_layout(self.channels)
         codec_ctx.format = av.AudioFormat(self.av_format)  # type: ignore
         codec_ctx.sample_rate = self.sample_rate
 
@@ -630,7 +651,7 @@ class FlacStreamEncoder:
         frame = av.AudioFrame.from_ndarray(  # type: ignore
             flat,
             format=self.av_format,
-            layout="stereo" if self.channels == 2 else "mono",
+            layout=_flac_layout(self.channels),
         )
         frame.rate = self.sample_rate
         before = len(self._buffer)

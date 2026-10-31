@@ -41,6 +41,15 @@ from typing import Literal, Optional
 ReplayGainMode = Literal["off", "track", "album"]
 VALID_MODES: tuple[str, ...] = ("off", "track", "album")
 
+# Reference level TIDAL normalizes its own ReplayGain tags against.
+# Measured against a downloaded copy of "As It Was": TIDAL ships
+# trackReplayGain = -7.76 dB for a master that our R128 meter puts at
+# -5.86 LUFS, i.e. their gain aims for about -14 LUFS, not Apple's
+# -16. Everything else Tideway levels (downloaded files, Atmos) targets
+# loudness.TARGET_LUFS, so streamed tags need this offset to land on
+# the same reference.
+TIDAL_TAG_REFERENCE_LUFS = -14.0
+
 
 @dataclass
 class ReplayGainTags:
@@ -56,19 +65,33 @@ class ReplayGainTags:
     album_peak: Optional[float] = None
 
 
+def _clamp_to_peak(total: float, peak: Optional[float], prevent_clipping: bool) -> float:
+    """Cap `total` so peak * 10**(total/20) ≤ 1.0 when clipping
+    prevention is on. For peaks already above unity the cap is
+    negative — those masters always attenuate."""
+    if prevent_clipping and peak is not None and peak > 0:
+        max_gain = -20.0 * math.log10(float(peak))
+        if total > max_gain:
+            return max_gain
+    return total
+
+
 def compute_gain_db(
     tags: ReplayGainTags,
     mode: ReplayGainMode,
     preamp_db: float,
     prevent_clipping: bool,
+    reference_shift_db: float = 0.0,
 ) -> float:
     """Resolve the dB offset to apply for the active mode.
 
     Returns 0.0 (no change) when the mode is "off" or when the chosen
     tag is missing on this stream — falling back to flat output is the
     only sane "we don't have data" behaviour. The user's `preamp_db`
-    is added on top of the ReplayGain value; clipping prevention then
-    clamps the total against the chosen peak.
+    is added on top of the ReplayGain value, plus `reference_shift_db`
+    when the tags come from a source with a different reference level
+    (TIDAL's own tags aim at -14 LUFS; see TIDAL_TAG_REFERENCE_LUFS).
+    Clipping prevention then clamps the total against the chosen peak.
     """
     if mode == "off":
         return 0.0
@@ -83,15 +106,29 @@ def compute_gain_db(
         # the next track's tag is read; this is a per-stream skip,
         # not a feature toggle.
         return 0.0
-    total = float(rg) + float(preamp_db)
-    if prevent_clipping and peak is not None and peak > 0:
-        # Largest gain that keeps peak * 10**(g/20) ≤ 1.0 → cap at
-        # -20*log10(peak). For peaks already > 1.0 (some loud
-        # masters) the cap is negative — i.e. we always attenuate.
-        max_gain = -20.0 * math.log10(float(peak))
-        if total > max_gain:
-            total = max_gain
-    return total
+    total = float(rg) + float(preamp_db) + float(reference_shift_db)
+    return _clamp_to_peak(total, peak, prevent_clipping)
+
+
+def compute_measured_gain_db(
+    loudness_lufs: Optional[float],
+    peak: Optional[float],
+    target_lufs: float,
+    preamp_db: float,
+    prevent_clipping: bool,
+) -> float:
+    """Same contract as `compute_gain_db`, but the loudness comes from
+    a local EBU R128 measurement instead of shipped tags. Used on the
+    native Atmos path, whose files carry no ReplayGain tags at all.
+
+    Returns 0.0 when there is nothing to measure against (silence, or
+    a file the meter couldn't read) so the track plays at its own
+    level rather than at a guess.
+    """
+    if loudness_lufs is None:
+        return 0.0
+    total = (float(target_lufs) - float(loudness_lufs)) + float(preamp_db)
+    return _clamp_to_peak(total, peak, prevent_clipping)
 
 
 class ReplayGain:

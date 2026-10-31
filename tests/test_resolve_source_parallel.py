@@ -232,6 +232,56 @@ def test_resolve_source_cache_hit_returns_stored_metadata():
     assert player._current_track_meta == stored_meta
 
 
+def test_resolve_source_plays_when_track_metadata_is_missing():
+    """The metadata fetch is presentation-only.
+
+    Tidal's v2 catalog (and its radio/mixes) can surface ids that
+    `tracks/{id}` 404s while `playbackinfopostpaywall` still streams
+    them. Failing the resolve on that 404 made such a track unplayable
+    once its on-disk cache was deleted.
+    """
+    from app.audio.player import PCMPlayer
+
+    class _Http404(Exception):
+        pass
+
+    player = PCMPlayer.__new__(PCMPlayer)
+    player._manifest_cache = MagicMock()
+    player._manifest_cache.lookup.return_value = None
+    player._local_lookup = None
+    player._quality_clamp = None
+    player._current_track_meta = {"title": "PREVIOUS"}
+
+    session = MagicMock()
+    session.config.quality = "LOSSLESS"
+    session.track.side_effect = _Http404("HTTP Error 404")
+
+    holder = MagicMock()
+    holder.get_stream.return_value = MagicMock(
+        get_stream_manifest=lambda: MagicMock(
+            urls=["http://seg/0"], codecs="FLAC", is_encrypted=False
+        ),
+        bit_depth=24,
+        sample_rate=48000,
+        audio_quality="HI_RES_LOSSLESS",
+        audio_mode=None,
+    )
+    player._session_getter = lambda: session
+
+    with patch("app.audio.player.tidalapi.Track", return_value=holder):
+        urls, duration_s, info, _, track_meta = player._resolve_source(
+            "251363269", quality=None
+        )
+
+    assert urls == ["http://seg/0"]
+    assert duration_s is None
+    assert track_meta is None
+    # Unknown metadata must not clobber whatever the renderer was told
+    # about the track that is actually playing.
+    assert player._current_track_meta == {"title": "PREVIOUS"}
+    assert info.audio_quality == "HI_RES_LOSSLESS"
+
+
 def test_prefetch_does_not_pollute_current_track_meta():
     """Speculative prefetch must NOT overwrite `_current_track_meta`.
 

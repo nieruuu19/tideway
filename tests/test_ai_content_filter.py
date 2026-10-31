@@ -65,7 +65,8 @@ def _fake_track(ai, name="Song", tid="1"):
 
 
 # --------------------------------------------------------------------
-# Parse patch: tidalapi drops `ai`; app.tidal_client puts it back.
+# Parse patch: tidalapi drops `ai` and `audioModes`;
+# app.tidal_client puts them back.
 # --------------------------------------------------------------------
 
 
@@ -73,9 +74,10 @@ def test_parse_patch_installed():
     import app.tidal_client  # noqa: F401  (import applies the patch)
     from tidalapi.media import Track
 
-    assert Track.parse_track.__name__ == "parse_track_with_ai"
+    assert Track.parse_track.__name__ == "parse_track_with_ai_and_atmos"
     # Class-level default so getattr on a pre-patch object is safe.
     assert Track.ai is None
+    assert Track.is_dolby_atmos is False
 
 
 @pytest.mark.parametrize(

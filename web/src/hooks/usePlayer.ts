@@ -3,10 +3,12 @@ import type { PlayerSnapshot, StreamInfo, Track } from "@/api/types";
 import { api } from "@/api/client";
 import { subscribeEvents } from "@/api/eventStream";
 import { useContinuePlayingPref } from "./useContinuePlayingPref";
+import { usePlayerOwnership } from "./usePlayerOwnership";
 import { useSleepTimer } from "./useSleepTimer";
 import { useUiPreferences, type StreamingQuality } from "./useUiPreferences";
 import {
   loadPersisted,
+  PERSIST_KEY,
   pickRestoreFromPersisted,
   usePlayerPersistence,
   type PersistedState,
@@ -250,6 +252,56 @@ function resolveShuffleOrder(state: PlayerState): number[] {
 }
 
 /**
+ * Whether an error frame means "skip this track".
+ *
+ * Autoplay skips past ids the backend can't play (region-locked radio
+ * tracks, delisted releases) so a listening session doesn't die on one
+ * bad row. A Tidal rate-limit refusal is not about the row, though:
+ * every remaining track would fail the same way, so skipping walks the
+ * queue into the same closed gate and each attempt is another strike
+ * against the account. Those frames carry `error_kind: "backoff"`.
+ */
+export function shouldSkipOnError(
+  snap: Pick<PlayerSnapshot, "state" | "error_kind">,
+  continuePlaying: boolean,
+): boolean {
+  return (
+    snap.state === "error" && continuePlaying && snap.error_kind !== "backoff"
+  );
+}
+
+/**
+ * Index of `id` in `queue`, searching forward from `from` and wrapping.
+ *
+ * A playlist can legitimately contain the same track twice, so a plain
+ * `findIndex` after resyncing would jump back to the first copy and the
+ * Next button would replay half the queue. Starting at the index the
+ * player currently points at keeps duplicate entries distinct.
+ */
+export function nearestQueueIndex(
+  queue: Track[],
+  id: string,
+  from: number,
+): number {
+  const len = queue.length;
+  if (len === 0) return -1;
+  const start = from >= 0 && from < len ? from : 0;
+  for (let step = 0; step < len; step++) {
+    const i = (start + step) % len;
+    if (queue[i].id === id) return i;
+  }
+  return -1;
+}
+
+function sameQueueIds(a: Track[], b: Track[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].id !== b[i].id) return false;
+  }
+  return true;
+}
+
+/**
  * Pick the next queue index given the current state.
  *
  * `onEnded` is true when the track just finished naturally — in that
@@ -445,6 +497,14 @@ export function usePlayer() {
     stateRef.current = state;
   }, [state]);
 
+  // One page drives the backend at a time. A second Tideway page (a
+  // duplicated tab, a browser tab next to the app window) runs its own
+  // queue against the same backend and would otherwise advance on every
+  // `ended` with a different "next" track — the wrong-track flash and
+  // the playlist drifting into unrelated songs. See
+  // `usePlayerOwnership` for the lease itself.
+  const { isOwnerRef, claimOwnership } = usePlayerOwnership();
+
   // Backend backstop hydration. The useState initializer above seeds
   // from localStorage, which is the fast path. But pywebview's
   // WKWebView on macOS sometimes loses localStorage between launches
@@ -497,7 +557,56 @@ export function usePlayer() {
   // Persist queue + prefs so a relaunch picks up where the user
   // left off. Owned by usePlayerPersistence — see that file's
   // docstring for the lifecycle-hook trio + backend-backstop story.
-  usePlayerPersistence(stateRef, qualityRef);
+  // Only the page holding the playback lease writes: viewers must not
+  // overwrite the backstop with their own (possibly stale) queue.
+  usePlayerPersistence(stateRef, qualityRef, isOwnerRef);
+
+  // Viewer pages mirror the controller's queue. Every page on this
+  // origin shares localStorage and only the lease holder writes it, so a
+  // `storage` event is the holder's newest snapshot. Without this the
+  // second page kept acting on a queue that had long since diverged —
+  // pressing Next there restarted the other page's radio tail instead
+  // of the playlist that was actually playing.
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== PERSIST_KEY || e.newValue === null) return;
+      if (isOwnerRef.current) return;
+      try {
+        const persisted = JSON.parse(e.newValue) as Partial<PersistedState>;
+        if (!Array.isArray(persisted.queue)) return;
+        const incoming = persisted.queue as Track[];
+        setState((s) => {
+          if (sameQueueIds(s.queue, incoming)) return s;
+          const found = s.track
+            ? nearestQueueIndex(incoming, s.track.id, s.queueIndex)
+            : -1;
+          const fallback =
+            s.queueIndex >= 0 && s.queueIndex < incoming.length
+              ? s.queueIndex
+              : incoming.length > 0
+                ? 0
+                : -1;
+          return {
+            ...s,
+            queue: incoming,
+            queueIndex: found >= 0 ? found : fallback,
+            shuffle: !!persisted.shuffle,
+            shuffleOrder: Array.isArray(persisted.shuffleOrder)
+              ? persisted.shuffleOrder
+              : [],
+            repeat:
+              persisted.repeat === "all" || persisted.repeat === "one"
+                ? persisted.repeat
+                : "off",
+          };
+        });
+      } catch {
+        /* malformed snapshot */
+      }
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, [isOwnerRef]);
 
   // SSE subscription — backend pushes state changes + position updates.
   // `seq` is our monotonic clock so we can ignore out-of-order frames.
@@ -565,6 +674,13 @@ export function usePlayer() {
   // volume with 100 % whenever pywebview lost localStorage.
   const serverVolumeAdopted = useRef(false);
   const serverMutedAdopted = useRef(false);
+  // Lets a play/load call apply its own response immediately instead of
+  // waiting for the next SSE frame — that subscription pushes at ~4 Hz,
+  // so the optimistic `loading` state could outlive the backend's
+  // answer by up to a quarter second on every skip.
+  const applyResponseRef = useRef<((snap: PlayerSnapshot) => void) | null>(
+    null,
+  );
 
   useEffect(() => {
     // Late-echo guard: drop snapshots whose track_id doesn't match
@@ -619,13 +735,21 @@ export function usePlayer() {
     // the in-flight window the bar shows the previous track.
     const syncTrackFromQueueOrApi = (snap: PlayerSnapshot) => {
       const cur = stateRef.current;
-      const trackOutOfSync =
-        snap.track_id !== null &&
-        snap.state !== "idle" &&
-        snap.state !== "ended" &&
-        (!cur.track || cur.track.id !== snap.track_id);
-      if (!trackOutOfSync || !snap.track_id) return;
+      if (
+        snap.track_id === null ||
+        snap.state === "idle" ||
+        snap.state === "ended"
+      ) {
+        return;
+      }
       const id = snap.track_id;
+      // Repair the queue pointer even when the track itself matches.
+      // A second Tideway page (or a queue adopted from one) can leave
+      // `queueIndex` pointing at a different row than the track that is
+      // playing; `pickNextIndex` would then advance from the wrong
+      // place and skip tracks.
+      const idxAtCursor = cur.queue[cur.queueIndex]?.id === id;
+      if (cur.track?.id === id && idxAtCursor) return;
       const queueIdx = cur.queue.findIndex((q) => q.id === id);
       if (queueIdx >= 0) {
         // Path 1: queue has it. Sync state.track from queue.
@@ -634,9 +758,9 @@ export function usePlayer() {
           // Re-check inside the reducer: another setState may have
           // already synced track (e.g. playAtIndex's optimistic
           // update commits between the outer check and here).
-          if (s.track?.id === id) return s;
-          const idx = s.queue.findIndex((q) => q.id === id);
+          const idx = nearestQueueIndex(s.queue, id, s.queueIndex);
           if (idx < 0) return s;
+          if (s.track?.id === id && s.queueIndex === idx) return s;
           return { ...s, track: s.queue[idx], queueIndex: idx };
         });
       } else if (rehydratingTrackIdRef.current !== id) {
@@ -655,9 +779,19 @@ export function usePlayer() {
               // queue change) put the track into the queue while
               // our fetch was in flight, prefer the queue's index
               // over a single-track replacement.
-              const existingIdx = s.queue.findIndex((q) => q.id === id);
+              const existingIdx = nearestQueueIndex(s.queue, id, s.queueIndex);
               if (existingIdx >= 0) {
                 return { ...s, track: t, queueIndex: existingIdx };
+              }
+              // Never collapse a live queue. The backend can be
+              // playing a track this page doesn't have — the other
+              // page advanced, or a renderer-clock auto-advance ran.
+              // Replacing the queue with `[t]` turned the following
+              // natural end into an end-of-queue radio takeover,
+              // which is how a playlist session wandered off into
+              // unrelated songs.
+              if (s.queue.length > 0) {
+                return { ...s, track: t, queueIndex: -1 };
               }
               return {
                 ...s,
@@ -749,6 +883,10 @@ export function usePlayer() {
     // buffer is freed as soon as the swap completes or the queue
     // changes.
     const triggerPreloadIfNeeded = (snap: PlayerSnapshot) => {
+      // Viewers don't stage the next track: with two pages each holding
+      // a different queue, the backend kept flip-flopping between two
+      // preloads and played the wrong one at the boundary.
+      if (!isOwnerRef.current) return;
       if (snap.state !== "playing" || snap.track_id === null) {
         return;
       }
@@ -814,20 +952,40 @@ export function usePlayer() {
       applyTransportState(snap);
       // Advance triggers fire AFTER the state setState so any
       // ended-branch UI ticks land before the next track's
-      // optimistic update overwrites them.
-      if (snap.state === "ended") advanceRef.current();
+      // optimistic update overwrites them. Only the page holding the
+      // playback lease advances: every page receives the same `ended`
+      // frame, and two pages advancing with their own queues is what
+      // played a stray track at each boundary and dragged the session
+      // out of the playlist.
+      if (snap.state === "ended" && isOwnerRef.current) advanceRef.current();
       // Skip past tracks the backend can't play. Without this,
       // autoplay halts the moment radio hands us a region-locked
       // or otherwise unstreamable id. The expected-track guard
       // (isLateEcho) naturally dedupes repeat error frames for the
       // same track, so we only advance once per failure.
-      if (snap.state === "error" && continuePlayingRef.current) {
+      if (
+        isOwnerRef.current &&
+        shouldSkipOnError(snap, continuePlayingRef.current)
+      ) {
         advanceRef.current();
       }
       triggerPreloadIfNeeded(snap);
     };
 
-    return subscribeEvents("player", (data) => {
+    // Used by the click path: the HTTP response *is* a snapshot, so the
+    // bar can leave `loading` the moment the backend answers. Guarded
+    // the same way the SSE frames are — an older seq, or a response for
+    // a track the user has already moved off, must not land.
+    applyResponseRef.current = (snap: PlayerSnapshot) => {
+      if (snap.track_id !== expectedTrackIdRef.current) return;
+      if (snap.seq < lastSeqRef.current) return;
+      lastSeqRef.current = snap.seq;
+      lastPositionRef.current = snap.position_ms;
+      applyTransportState(snap);
+      triggerPreloadIfNeeded(snap);
+    };
+
+    const unsubscribe = subscribeEvents("player", (data) => {
       try {
         const snap = JSON.parse(data) as PlayerSnapshot;
         // A newer seq always applies. A repeat seq still applies when
@@ -851,7 +1009,11 @@ export function usePlayer() {
         /* malformed frame */
       }
     });
-  }, []);
+    return () => {
+      applyResponseRef.current = null;
+      unsubscribe();
+    };
+  }, [isOwnerRef]);
 
   // macOS Now Playing metadata push. The backend's PlayerSnapshot has
   // track_id but no title / artist / album / cover, and on macOS we
@@ -955,12 +1117,12 @@ export function usePlayer() {
             await api.player.seek(fraction);
           }
         }
-        // No setState for `loading` here. PCMPlayer.load()
-        // transitions to "paused" when it returns; the SSE pushes
-        // that snapshot, and applySnapshot updates state.loading
-        // accordingly. The backend snapshot is the source of truth
-        // for transport state — duplicating it here would just
-        // create two ways for it to disagree.
+        // No setState for `loading` here. load() transitions to
+        // "paused" when it returns (the native Atmos path included);
+        // the SSE pushes that snapshot, and applySnapshot updates
+        // state.loading accordingly. The backend snapshot is the source
+        // of truth for transport state — duplicating it here would
+        // just create two ways for it to disagree.
       } catch {
         // Track is no longer streamable (region / license change /
         // stale id). Clear the persisted now-playing so the UI
@@ -994,6 +1156,10 @@ export function usePlayer() {
       // pure; ref writes belong outside the updater.
       const resolvedQueue = queueOverride ?? stateRef.current.queue;
       if (index < 0 || index >= resolvedQueue.length) return;
+      // The page the user is driving takes the lease, so the next
+      // natural end advances from THIS queue rather than the other
+      // page's.
+      claimOwnership();
       const track = resolvedQueue[index];
       expectedTrackIdRef.current = track.id;
       endOfTrackPendingRef.current = false;
@@ -1036,7 +1202,9 @@ export function usePlayer() {
           // Single round-trip for load+play — saves ~20-40ms of await
           // gap between two HTTP calls and lets the backend start priming
           // the decoder immediately after set_media, where the delay lives.
-          await api.player.playTrack(track.id, qualityRef.current);
+          const snap = await api.player.playTrack(track.id, qualityRef.current);
+          // Merge the answer now rather than waiting for the SSE tick.
+          applyResponseRef.current?.(snap);
         } catch (err) {
           setState((cur) => ({
             ...cur,
@@ -1047,7 +1215,7 @@ export function usePlayer() {
         }
       })();
     },
-    [],
+    [claimOwnership],
   );
 
   // Load a queue position into the backend without auto-playing —
@@ -1062,6 +1230,10 @@ export function usePlayer() {
     ) => {
       const resolvedQueue = queueOverride ?? stateRef.current.queue;
       if (index < 0 || index >= resolvedQueue.length) return;
+      // The page the user is driving takes the lease, so the next
+      // natural end advances from THIS queue rather than the other
+      // page's.
+      claimOwnership();
       const track = resolvedQueue[index];
       expectedTrackIdRef.current = track.id;
       endOfTrackPendingRef.current = false;
@@ -1092,7 +1264,8 @@ export function usePlayer() {
       // StrictMode dev double-invoke fix as playAtIndex.
       void (async () => {
         try {
-          await api.player.load(track.id, qualityRef.current);
+          const snap = await api.player.load(track.id, qualityRef.current);
+          applyResponseRef.current?.(snap);
         } catch (err) {
           setState((cur) => ({
             ...cur,
@@ -1103,7 +1276,7 @@ export function usePlayer() {
         }
       })();
     },
-    [],
+    [claimOwnership],
   );
 
   // Behavior tree for "queue is over, where do we go?". Shared by
@@ -1209,12 +1382,13 @@ export function usePlayer() {
   const toggle = useCallback(() => {
     const s = stateRef.current;
     if (!s.track) return;
+    claimOwnership();
     if (s.playing) {
       void api.player.pause().catch(() => {});
     } else {
       void api.player.resume().catch(() => {});
     }
-  }, []);
+  }, [claimOwnership]);
 
   const next = useCallback(() => {
     // The naive answer is `pickNextIndex(stateRef.current)`, but
@@ -1254,6 +1428,7 @@ export function usePlayer() {
   const prev = useCallback(() => {
     // Same stale-stateRef guard as `next`; see comment there.
     const s = stateRef.current;
+    claimOwnership();
     const intendedId = expectedTrackIdRef.current;
     const intendedIdx = intendedId
       ? s.queue.findIndex((t) => t.id === intendedId)
@@ -1276,10 +1451,11 @@ export function usePlayer() {
       return;
     }
     playAtIndex(p);
-  }, [playAtIndex]);
+  }, [playAtIndex, claimOwnership]);
 
   const seek = useCallback((t: number) => {
     const s = stateRef.current;
+    claimOwnership();
     const cap = s.duration || Infinity;
     const clamped = Math.max(0, Math.min(cap, t));
     const fraction = cap && cap > 0 && cap !== Infinity ? clamped / cap : 0;
@@ -1290,7 +1466,7 @@ export function usePlayer() {
     preloadedNextIdRef.current = null;
     preloadedForTrackRef.current = null;
     void api.player.seek(fraction).catch(() => {});
-  }, []);
+  }, [claimOwnership]);
 
   const restart = useCallback(() => {
     // Restart the current track from the top — what double-clicking the
@@ -1300,6 +1476,7 @@ export function usePlayer() {
     // "play this from the start". No-op when nothing is loaded.
     const s = stateRef.current;
     if (!s.track) return;
+    claimOwnership();
     setState((cur) => ({ ...cur, currentTime: 0 }));
     preloadedNextIdRef.current = null;
     preloadedForTrackRef.current = null;
@@ -1307,19 +1484,24 @@ export function usePlayer() {
     if (!s.playing) {
       void api.player.resume().catch(() => {});
     }
-  }, []);
+  }, [claimOwnership]);
 
   const stop = useCallback(() => {
+    claimOwnership();
     expectedTrackIdRef.current = null;
     void api.player.stop().catch(() => {});
     setState(INITIAL);
-  }, []);
+  }, [claimOwnership]);
 
-  const setVolume = useCallback((v: number) => {
-    const clamped = Math.max(0, Math.min(1, v));
-    setState((s) => ({ ...s, volume: clamped }));
-    void api.player.volume(Math.round(clamped * 100)).catch(() => {});
-  }, []);
+  const setVolume = useCallback(
+    (v: number) => {
+      claimOwnership();
+      const clamped = Math.max(0, Math.min(1, v));
+      setState((s) => ({ ...s, volume: clamped }));
+      void api.player.volume(Math.round(clamped * 100)).catch(() => {});
+    },
+    [claimOwnership],
+  );
 
   const toggleMute = useCallback(() => {
     // Flip the backend mute flag, which silences output without
@@ -1327,6 +1509,7 @@ export function usePlayer() {
     // Optimistic so the icon reacts instantly; the snapshot echo of
     // this same value just confirms it.
     const s = stateRef.current;
+    claimOwnership();
     const nextMuted = !s.muted;
     setState((cur) => ({ ...cur, muted: nextMuted }));
     void api.player.muted(nextMuted).catch(() => {
@@ -1334,9 +1517,10 @@ export function usePlayer() {
       // backend's real state.
       setState((cur) => ({ ...cur, muted: !nextMuted }));
     });
-  }, []);
+  }, [claimOwnership]);
 
   const toggleShuffle = useCallback(() => {
+    claimOwnership();
     setState((s) => {
       const shuffle = !s.shuffle;
       return {
@@ -1350,14 +1534,15 @@ export function usePlayer() {
           : [],
       };
     });
-  }, []);
+  }, [claimOwnership]);
 
   const cycleRepeat = useCallback(() => {
+    claimOwnership();
     setState((s) => ({
       ...s,
       repeat: s.repeat === "off" ? "all" : s.repeat === "all" ? "one" : "off",
     }));
-  }, []);
+  }, [claimOwnership]);
 
   // Global media-key bridge. The backend's pynput listener publishes
   // hotkey actions (play_pause / next / previous) as `hotkey` events on
@@ -1380,6 +1565,10 @@ export function usePlayer() {
       subscribeEvents("hotkey", (data) => {
         try {
           const { action } = JSON.parse(data) as { action?: string };
+          // The backend broadcasts media keys to every page. Only the
+          // lease holder acts; otherwise each page would apply the
+          // press to its own queue and playback would ping-pong.
+          if (!isOwnerRef.current) return;
           if (action === "play_pause") toggleRef.current?.();
           else if (action === "next") nextRef.current?.();
           else if (action === "previous") prevRef.current?.();
@@ -1387,7 +1576,7 @@ export function usePlayer() {
           /* malformed frame */
         }
       }),
-    [],
+    [isOwnerRef],
   );
 
   // Sleep-timer state machine. Owned by useSleepTimer; we hand it

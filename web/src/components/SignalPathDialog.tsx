@@ -227,6 +227,18 @@ function formatSource(src: SignalPath["source"]): string {
 
 function formatReplayGain(rg: SignalPath["replaygain"]): string {
   if (rg.mode === "off") return "off";
+  if (rg.source === "measured") {
+    const lufs =
+      rg.loudness_lufs !== null ? ` (${rg.loudness_lufs.toFixed(1)} LUFS)` : "";
+    const want = `${rg.applied_db >= 0 ? "+" : ""}${rg.applied_db.toFixed(1)} dB`;
+    const got = `${rg.applied_effective_db >= 0 ? "+" : ""}${rg.applied_effective_db.toFixed(1)} dB`;
+    const capped =
+      Math.abs(rg.applied_effective_db - rg.applied_db) > 0.05
+        ? ` — ${got} after headroom cap`
+        : "";
+    return `measured${lufs} — ${want}${capped}`;
+  }
+  if (rg.source === "pending") return `${rg.mode} mode — measuring this file…`;
   if (!rg.tags_present) return `${rg.mode} mode — no tags on this track`;
   const sign = rg.applied_db >= 0 ? "+" : "";
   return `${rg.mode} mode — ${sign}${rg.applied_db.toFixed(1)} dB`;

@@ -29,9 +29,10 @@ import {
   usePlayerTime,
 } from "@/hooks/PlayerContext";
 import { Button } from "@/components/ui/button";
+import { SeekBar } from "@/components/SeekBar";
 import { HeartButton } from "@/components/HeartButton";
 import { DownloadButton } from "@/components/DownloadButton";
-import { cn, darkenForLightText, formatDuration, imageUrl } from "@/lib/utils";
+import { cn, darkenForLightText, imageUrl } from "@/lib/utils";
 
 // Right-pane tab in the full-screen player. Matches the affordance
 // the official Tidal desktop client surfaces in the same view —
@@ -77,7 +78,6 @@ export function FullScreenPlayer({
   const isLocal = useIsDownloaded(track?.id ?? "");
   const cover = imageUrl(track?.album?.cover);
   const dominant = useCoverColor(cover);
-  const pct = duration > 0 ? (currentTime / duration) * 100 : 0;
 
   const [activeTab, setActiveTab] = useState<RightPaneTab>("lyrics");
 
@@ -306,27 +306,12 @@ export function FullScreenPlayer({
                 <Minimize2 className="h-4 w-4" />
               </Button>
             </div>
-            <div className="flex w-full max-w-xl items-center gap-2 text-[11px] text-foreground/70">
-              <span className="w-10 text-right tabular-nums">
-                {formatDuration(currentTime)}
-              </span>
-              <input
-                type="range"
-                min={0}
-                max={Math.max(duration, 1)}
-                step={0.1}
-                value={Math.min(currentTime, duration || 0)}
-                onChange={(e) => actions.seek(Number(e.target.value))}
-                className="h-1 flex-1 cursor-pointer appearance-none rounded-full accent-primary"
-                style={{
-                  background: `linear-gradient(to right, white ${pct}%, rgba(255,255,255,0.2) ${pct}%)`,
-                }}
-                aria-label="Seek"
-              />
-              <span className="w-10 tabular-nums">
-                {formatDuration(duration)}
-              </span>
-            </div>
+            <SeekBar
+              variant="overlay"
+              currentTime={currentTime}
+              duration={duration}
+              onSeek={actions.seek}
+            />
           </div>
 
           <div className="flex flex-1 justify-end gap-2">

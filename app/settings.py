@@ -162,6 +162,19 @@ class Settings:
     # local state. Lets users play / manage files they already downloaded
     # without signing in.
     offline_mode: bool = False
+    # OAuth client used for the device-code login (index into
+    # app/api_keys.py). TIDAL binds tokens to the issuing client and
+    # chooses the manifest delivery format from it, so this is also the
+    # knob that decides whether a Dolby Atmos stream arrives encrypted.
+    # 5 = "Tidal HiRes", the same default tidekeeper uses.
+    tidal_api_key_index: int = 5
+    # OAuth client used for the PKCE (browser) login. 0 keeps
+    # tidalapi's built-in mobile client, which is the only pair known to
+    # be entitled for Max; any other value is an index into
+    # app/api_keys.py and mints the PKCE token under that client instead
+    # (experimental — useful when a different client yields a clear
+    # Atmos manifest).
+    tidal_pkce_client_index: int = 0
     # Opt-in desktop notifications when a download burst finishes.
     # Fires both the browser-side toast and a native OS notification
     # (via app/notify.py) — the OS path is what reaches the user
@@ -299,6 +312,26 @@ class Settings:
     # (certain USB DACs at certain rates) will refuse — stream open
     # raises and the player surfaces the error.
     exclusive_mode: bool = False
+    # Play local Dolby Atmos files through Windows' own media
+    # pipeline instead of PyAV. PyAV decodes the E-AC-3 core bed but
+    # drops the JOC object metadata, so heights/objects never reach
+    # the endpoint's spatial renderer ("Dolby Atmos for Headphones").
+    # The native path (MediaPlayer + Dolby's decoder MFT) renders the
+    # objects, at the cost of EQ, crossfeed, ReplayGain and gapless —
+    # which is why it applies only to files whose container profile
+    # names Atmos. Windows-only; harmless (never triggers) elsewhere.
+    native_atmos_playback: bool = True
+    # Start a streamed Atmos track while it is still downloading,
+    # instead of waiting for the whole 20-30 MB asset. The TIDAL
+    # segments are published over loopback as a tiny DASH presentation
+    # (app/audio/atmos_dash.py) and the helper hands the manifest to
+    # MediaPlayer's AdaptiveMediaSource — the same client Edge uses —
+    # so playback starts on the first 4 s segment (measured ~0.5 s on
+    # a cold track, before the download finishes 20 s later). A plain
+    # file source cannot do this: MediaPlayer will not open a file it
+    # cannot see the end of, which is why the earlier growing-file
+    # prototype played silence.
+    atmos_dash_stream: bool = True
     # Force Volume — pin the software volume at 100 % and rely on the
     # user's DAC, speakers, or OS volume to attenuate. Pairs naturally
     # with Exclusive Mode: once you're pushing bit-perfect samples to

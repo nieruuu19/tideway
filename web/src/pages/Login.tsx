@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ExternalLink, Loader2, LogIn } from "lucide-react";
 import { api } from "@/api/client";
+import type { TidalLoginClient } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { retryBoot } from "@/lib/bootRetry";
 import { resetQualitiesCache } from "@/hooks/useQualities";
 import { refreshSubscription } from "@/hooks/useSubscription";
 
@@ -57,11 +59,31 @@ function PkceLogin({
   const [redirectUrl, setRedirectUrl] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [clients, setClients] = useState<TidalLoginClient[]>([]);
+  const [selectedClient, setSelectedClient] = useState<number | null>(null);
+  const [clientError, setClientError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    api.auth
-      .pkceUrl()
+    retryBoot(() => api.auth.clients())
+      .then((r) => {
+        if (cancelled) return;
+        setClients(r.pkce_clients);
+        setSelectedClient(r.pkce_selected);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setClientError("Couldn't load the TIDAL client list.");
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    retryBoot(() => api.auth.pkceUrl())
       .then((r) => {
         if (!cancelled) setLoginUrl(r.url);
       })
@@ -72,6 +94,20 @@ function PkceLogin({
       cancelled = true;
     };
   }, []);
+
+  const changeClient = async (index: number) => {
+    setClientError(null);
+    setLoginUrl(null);
+    try {
+      await api.auth.selectPkceClient(index);
+      setSelectedClient(index);
+      // The URL embeds the client_id, so fetch a fresh one.
+      const r = await api.auth.pkceUrl();
+      setLoginUrl(r.url);
+    } catch (err) {
+      setClientError(err instanceof Error ? err.message : String(err));
+    }
+  };
 
   const openTidalLogin = async () => {
     if (!loginUrl) return;
@@ -101,6 +137,35 @@ function PkceLogin({
 
   return (
     <div className="flex w-full flex-col gap-4">
+      {clients.length > 1 && (
+        <div className="flex w-full flex-col gap-2">
+          <label
+            htmlFor="pkce-client"
+            className="text-xs font-semibold uppercase tracking-wider text-muted-foreground"
+          >
+            TIDAL client
+          </label>
+          <select
+            id="pkce-client"
+            value={selectedClient ?? clients[0]?.index ?? ""}
+            disabled={submitting}
+            onChange={(e) => changeClient(Number(e.target.value))}
+            className="h-10 w-full rounded-md border border-input bg-secondary px-3 text-sm"
+          >
+            {clients.map((client) => (
+              <option key={client.index} value={client.index}>
+                {client.platform} — {client.formats}
+              </option>
+            ))}
+          </select>
+          <p className="text-xs text-muted-foreground">
+            The mobile default is the only client known to unlock Max. Switch
+            clients if Tidal refuses Dolby Atmos, then log in again.
+          </p>
+        </div>
+      )}
+      {clientError && <p className="text-xs text-destructive">{clientError}</p>}
+
       <ol className="list-decimal space-y-2 pl-5 text-sm text-muted-foreground">
         <li>
           <button
@@ -187,6 +252,37 @@ function DeviceLogin({
     null,
   );
   const pollRef = useRef<number | null>(null);
+  const [clients, setClients] = useState<TidalLoginClient[]>([]);
+  const [selectedClient, setSelectedClient] = useState<number | null>(null);
+  const [clientError, setClientError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    retryBoot(() => api.auth.clients())
+      .then((r) => {
+        if (cancelled) return;
+        setClients(r.clients);
+        setSelectedClient(r.selected);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setClientError("Couldn't load the TIDAL client list.");
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const changeClient = async (index: number) => {
+    setClientError(null);
+    try {
+      await api.auth.selectClient(index);
+      setSelectedClient(index);
+    } catch (err) {
+      setClientError(err instanceof Error ? err.message : String(err));
+    }
+  };
 
   const startLogin = useCallback(async () => {
     setStatus("starting");
@@ -238,6 +334,35 @@ function DeviceLogin({
 
   return (
     <div className="flex w-full flex-col items-center gap-4">
+      {clients.length > 1 && (
+        <div className="flex w-full flex-col gap-2">
+          <label
+            htmlFor="tidal-client"
+            className="text-xs font-semibold uppercase tracking-wider text-muted-foreground"
+          >
+            TIDAL client
+          </label>
+          <select
+            id="tidal-client"
+            value={selectedClient ?? clients[0]?.index ?? ""}
+            disabled={status === "starting" || status === "waiting"}
+            onChange={(e) => changeClient(Number(e.target.value))}
+            className="h-10 w-full rounded-md border border-input bg-secondary px-3 text-sm"
+          >
+            {clients.map((client) => (
+              <option key={client.index} value={client.index}>
+                {client.platform} — {client.formats}
+              </option>
+            ))}
+          </select>
+          <p className="text-xs text-muted-foreground">
+            TIDAL picks the stream format per client. If Dolby Atmos falls back
+            to Max, switch clients and sign in again.
+          </p>
+        </div>
+      )}
+      {clientError && <p className="text-xs text-destructive">{clientError}</p>}
+
       {status === "idle" && (
         <Button onClick={startLogin} size="lg" className="w-full">
           <LogIn className="h-4 w-4" /> Login with Tidal

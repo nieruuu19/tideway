@@ -3,8 +3,11 @@
 Imports anything non-trivial lazily inside fixtures so collection
 doesn't fail for tests that don't need a fully-configured environment.
 """
+import atexit
 import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -19,6 +22,13 @@ import pytest
 # stops being usable as evidence. Set before server is ever imported,
 # which is why it is module level rather than a fixture.
 os.environ["TIDEWAY_NO_PERF_LOG"] = "1"
+
+# The streamed-track disk cache tees real segment bytes; point it at a
+# throwaway directory so tests never write fake tracks into the user's
+# StreamCache.
+_STREAM_CACHE_DIR = tempfile.mkdtemp(prefix="tideway-stream-cache-")
+atexit.register(shutil.rmtree, _STREAM_CACHE_DIR, ignore_errors=True)
+os.environ["TIDEWAY_STREAM_CACHE_DIR"] = _STREAM_CACHE_DIR
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:

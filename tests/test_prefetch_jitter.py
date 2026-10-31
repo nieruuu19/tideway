@@ -15,13 +15,12 @@ pair fires.
 These tests pin both halves of that contract:
 - `prefetch` calls `tidal_jitter_sleep` before resolving (so
   refactors can't silently remove it).
-- The prefetch endpoint runs at most 2 workers in parallel (so the
-  burst from a 12-track album never exceeds 6 in-flight Tidal calls
-  even at the worst overlap).
+- The prefetch endpoint warms tracks serially (so an album mount can
+  never outrun the request rate playback itself produces), and it
+  no-ops while the Tidal gate is closed.
 """
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
 
 
@@ -59,32 +58,70 @@ def test_player_prefetch_jitters_before_first_tidal_call():
     assert call_order == ["jitter", "resolve"], call_order
 
 
-def test_prefetch_endpoint_caps_at_two_workers():
-    """The endpoint constructs a ThreadPoolExecutor sized at most
-    `min(2, len(ids))`. We can't import server.py at unit-test time
-    cheaply, so this test re-creates the relevant expression from
-    that endpoint and checks its peak concurrency.
-    """
-    # Re-create the endpoint's pool sizing rule. If this test ever
-    # disagrees with server.py, server.py changed and the burst-cap
-    # contract may have regressed.
-    ids = [str(i) for i in range(12)]  # 12-track album
-    pool_workers = min(2, len(ids))
-    assert pool_workers == 2
+def test_prefetch_endpoint_warms_one_track_at_a_time(monkeypatch):
+    """Ten tracks at once is the shape that got the account suspended:
+    the per-track resolve fans out to several Tidal calls, so two
+    workers held the request rate at several per second. Warming
+    serially keeps it at the rate playback itself produces, and the
+    album's first tracks are still ready first because the order is
+    preserved."""
+    import threading
+    import time
 
-    in_flight = {"now": 0, "peak": 0}
-    lock = __import__("threading").Lock()
+    import server
+    from app import tidal_client
 
-    def task(_tid: str) -> None:
+    monkeypatch.setattr(tidal_client, "_tidal_backoff_until", 0.0)
+    state = {"now": 0, "peak": 0}
+    lock = threading.Lock()
+    order: list[str] = []
+
+    def fake_prefetch(track_id, quality, *, warm_bytes=True):  # noqa: ARG001
         with lock:
-            in_flight["now"] += 1
-            in_flight["peak"] = max(in_flight["peak"], in_flight["now"])
-        # Hold the slot briefly so concurrent workers actually overlap.
-        __import__("time").sleep(0.01)
+            state["now"] += 1
+            state["peak"] = max(state["peak"], state["now"])
+            order.append(track_id)
+        time.sleep(0.01)
         with lock:
-            in_flight["now"] -= 1
+            state["now"] -= 1
+        return True
 
-    with ThreadPoolExecutor(max_workers=pool_workers) as pool:
-        list(pool.map(task, ids))
+    fake_player = MagicMock()
+    fake_player.prefetch = fake_prefetch
+    monkeypatch.setattr(server, "_native_player", lambda: fake_player)
+    monkeypatch.setattr(server, "_require_local_access", lambda: None)
+    monkeypatch.setattr(server.settings, "offline_mode", False)
 
-    assert in_flight["peak"] == 2, f"peak concurrent prefetch was {in_flight['peak']}"
+    ids = [str(i) for i in range(10)]
+    out = server.player_prefetch(
+        server._PlayerPrefetchRequest(track_ids=ids, quality=None)
+    )
+
+    assert state["peak"] == 1, f"peak concurrent prefetch was {state['peak']}"
+    assert order == ids
+    assert out == {"prefetched": 10, "total": 10}
+
+
+def test_prefetch_endpoint_skips_while_the_gate_is_closed(monkeypatch):
+    """A suspended account refuses every resolve locally, so the pool
+    would only park workers in jitter sleeps — and album mounts land
+    in exactly this window (the user browses while playback is
+    blocked)."""
+    import time
+
+    import server
+    from app import tidal_client
+
+    monkeypatch.setattr(tidal_client, "_tidal_backoff_until", time.time() + 30)
+    fake_player = MagicMock()
+    monkeypatch.setattr(server, "_native_player", lambda: fake_player)
+    monkeypatch.setattr(server, "_require_local_access", lambda: None)
+    monkeypatch.setattr(server.settings, "offline_mode", False)
+
+    out = server.player_prefetch(
+        server._PlayerPrefetchRequest(track_ids=["1", "2"], quality=None)
+    )
+
+    assert out["skipped"] == "backoff"
+    assert out["prefetched"] == 0
+    fake_player.prefetch.assert_not_called()

@@ -5,6 +5,10 @@ import type {
   ArtistDetail,
   ArtistExtras,
   AuthStatus,
+  AtmosProbe,
+  AtmosTestDownload,
+  AtmosTestEngine,
+  AtmosTestStatus,
   Album,
   Artist,
   ContentKind,
@@ -43,6 +47,7 @@ import type {
   Settings,
   SignalPath,
   SubscriptionStatus,
+  TidalLoginClient,
   TidalPage,
   TidalUser,
   Track,
@@ -58,6 +63,13 @@ import type {
 // Known-slow endpoints (server-side fan-outs that take ~18s+ cold)
 // pass an opts.timeoutMs override; see `chartTopTracksResolved`.
 const DEFAULT_TIMEOUT_MS = 15_000;
+
+// Playback loads are the one place the backend may legitimately work
+// for a while: resolving a stream is bounded at 45s server-side, and a
+// Dolby Atmos stream is first buffered to a local file for the native
+// Windows pipeline. Aborting at 15s would leave the UI reporting a
+// failure while the backend went on to play the track.
+const PLAYER_LOAD_TIMEOUT_MS = 60_000;
 
 // AOTY's endpoints can block on a Cloudflare clearance solve. When the
 // app's webview profile has no usable `cf_clearance` — a fresh install,
@@ -268,6 +280,37 @@ export const api = {
     retrySession: () =>
       req<{ started: boolean }>("/api/auth/session/retry", { method: "POST" }),
     pkceUrl: () => req<{ url: string }>("/api/auth/pkce/url"),
+    /** OAuth clients for both login flows. `selected` drives the
+     *  device-code login; `pkce_selected` (0 = Tidal's mobile pair)
+     *  drives the browser login. */
+    clients: () =>
+      req<{
+        clients: TidalLoginClient[];
+        selected: number;
+        pkce_clients: TidalLoginClient[];
+        pkce_selected: number;
+      }>("/api/auth/clients"),
+    /** Choose the device-code client. A live device-code session is
+     *  signed out (`reauth_required`), because TIDAL binds tokens to
+     *  their issuing client. */
+    selectClient: (index: number) =>
+      req<{ ok: true; index: number; reauth_required: boolean }>(
+        "/api/auth/client",
+        {
+          method: "POST",
+          body: JSON.stringify({ index }),
+        },
+      ),
+    /** Choose the client that mints the next browser (PKCE) token.
+     *  Clears the cached login URL, which embeds the old client_id. */
+    selectPkceClient: (index: number) =>
+      req<{ ok: true; index: number; reauth_required: boolean }>(
+        "/api/auth/pkce-client",
+        {
+          method: "POST",
+          body: JSON.stringify({ index }),
+        },
+      ),
     pkceComplete: (redirect_url: string) =>
       req<{ status: "ok"; username: string | null }>(
         "/api/auth/pkce/complete",
@@ -1121,6 +1164,9 @@ export const api = {
   trackRadio: (id: string) => req<Track[]>(`/api/track/${id}/radio`),
   trackCredits: (id: string) => req<CreditEntry[]>(`/api/track/${id}/credits`),
   qualities: () => req<QualityOption[]>("/api/qualities"),
+  /** Streaming-only tiers for the playback picker (adds Dolby Atmos,
+   *  which is intentionally absent from the download-quality list). */
+  streamingQualities: () => req<QualityOption[]>("/api/streaming-qualities"),
   /** Subscription tier + download eligibility. UI uses this to gate
    *  the Download buttons — lossy-only accounts get a tooltip
    *  explaining why downloads aren't enabled. */
@@ -1169,19 +1215,27 @@ export const api = {
     available: () => req<{ available: boolean }>("/api/player/available"),
     state: () => req<PlayerSnapshot>("/api/player/state"),
     load: (trackId: string, quality?: string) =>
-      req<PlayerSnapshot>("/api/player/load", {
-        method: "POST",
-        body: JSON.stringify({ track_id: trackId, quality }),
-      }),
+      req<PlayerSnapshot>(
+        "/api/player/load",
+        {
+          method: "POST",
+          body: JSON.stringify({ track_id: trackId, quality }),
+        },
+        { timeoutMs: PLAYER_LOAD_TIMEOUT_MS },
+      ),
     /** Combined load + play in one call. Saves a network round-trip
      *  for auto-advance and keeps set_media + play back-to-back
      *  under the same backend lock so the decoder starts priming
      *  as soon as possible. */
     playTrack: (trackId: string, quality?: string) =>
-      req<PlayerSnapshot>("/api/player/play_track", {
-        method: "POST",
-        body: JSON.stringify({ track_id: trackId, quality }),
-      }),
+      req<PlayerSnapshot>(
+        "/api/player/play_track",
+        {
+          method: "POST",
+          body: JSON.stringify({ track_id: trackId, quality }),
+        },
+        { timeoutMs: PLAYER_LOAD_TIMEOUT_MS },
+      ),
     /** Pre-resolve the next track's manifest so auto-advance skips
      *  the network fetch. Fire-and-forget — a failed preload just
      *  means the subsequent load() pays the full cost as before. */
@@ -1491,6 +1545,30 @@ export const api = {
      *  every panel-open so the readout reflects the current track
      *  + the latest user toggles. */
     signalPath: () => req<SignalPath>("/api/player/signal-path"),
+    /** Dolby Atmos test panel. `windows` = MediaPlayer + Dolby's
+     *  decoder MFT; `tideway` = the normal PyAV engine. Both play a
+     *  local file in isolation (the queue is stopped first). */
+    atmosTest: {
+      capabilities: () =>
+        req<{ engines: AtmosTestEngine[]; downloads: AtmosTestDownload[] }>(
+          "/api/player/atmos-test/capabilities",
+        ),
+      probe: (path: string) =>
+        req<AtmosProbe>("/api/player/atmos-test/probe", {
+          method: "POST",
+          body: JSON.stringify({ path }),
+        }),
+      play: (path: string, engine: "windows" | "tideway") =>
+        req<AtmosTestStatus>("/api/player/atmos-test/play", {
+          method: "POST",
+          body: JSON.stringify({ path, engine }),
+        }),
+      status: () => req<AtmosTestStatus>("/api/player/atmos-test/status"),
+      stop: () =>
+        req<AtmosTestStatus>("/api/player/atmos-test/stop", {
+          method: "POST",
+        }),
+    },
   },
   /** Backend backstop for "what was playing when the user quit."
    *  Pairs with the frontend's localStorage persistence — see
